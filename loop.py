@@ -1,0 +1,256 @@
+"""The recursive loop.
+
+One iteration =
+
+    orchestrator (local LLM)  reads every previous iteration's feedback -> picks a strategy
+    coder        (local LLM)  writes a plugin implementing it
+    sandbox                   runs it on the frozen 5-fold split -> OOF AUC
+    repairer     (local LLM)  fixes and re-runs on failure (up to --repairs times)
+    kaggle                    submits, waits for the public score
+    critic       (local LLM)  writes a verdict
+
+The verdict, the CV, the leaderboard score and the strategy all go into the ledger, and
+build_context() feeds them to the NEXT iteration's orchestrator. That is the recursion:
+each loop searches with knowledge of what the previous loop measured.
+
+Usage:
+    PYTHONPATH=. .venv/bin/python loop.py --iterations 2
+    PYTHONPATH=. .venv/bin/python loop.py --iterations 2 --no-submit
+    PYTHONPATH=. .venv/bin/python loop.py --iterations 2 --rows 120000   # fast screening
+"""
+import argparse
+import json
+import time
+import traceback
+
+from agents import coder, ollama, orchestrator
+from harness import config as C
+from harness import evaluate, ledger, report, sandbox
+from harness.data import load
+
+
+PREFLIGHT_ROWS = 8000
+
+
+def _rule(txt=""):
+    print(f"\n{'='*78}\n{txt}\n{'='*78}" if txt else "=" * 78, flush=True)
+
+
+def best_loop_run():
+    """(exp_id, cv) of the best experiment the LOOP itself has produced, or (None, 0.0).
+
+    Deliberately excludes the reference pipeline: the loop's progress is measured against
+    its own trajectory, so iteration 2 is judged on whether it beat iteration 1.
+    """
+    with ledger.conn() as c:
+        r = c.execute(
+            "SELECT exp_id, cv_auc FROM experiments WHERE family='loop' "
+            "AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1"
+        ).fetchone()
+    return (r[0], r[1]) if r else (None, 0.0)
+
+
+def best_cv():
+    return best_loop_run()[1]
+
+
+def measured_noise_floor():
+    """The floor from `harness.confirm`, or the config prior if it has never been run."""
+    p = C.STATE / "noise_floor.txt"
+    if p.exists():
+        try:
+            return float(p.read_text().strip()), "measured"
+        except ValueError:
+            pass
+    return C.NOISE_FLOOR_PRIOR, "PRIOR -- run `python -m harness.confirm` to measure it"
+
+
+def judge(exp_id, cv, prev_id, prev_cv, screening=False):
+    """Apply the SPEC 5.3 promotion rule instead of a bare `delta > 0`.
+
+    Returns (status, detail). The first loop run has nothing to compare against, so it is
+    recorded as `baseline`, not `promoted` -- calling it an improvement would be a claim
+    about a comparison that was never made. Screening runs are not on the frozen split and
+    store no arrays, so they are never judged at all.
+    """
+    floor, src = measured_noise_floor()
+    if screening:
+        return "screening", {"floor": floor, "floor_source": src}
+    if prev_id is None:
+        return "baseline", {"floor": floor, "floor_source": src}
+
+    oof_new, _ = ledger.load_arrays(exp_id)
+    oof_ref, _ = ledger.load_arrays(prev_id)
+    _, _, y = load()
+    status, detail = evaluate.promote(y, oof_new, oof_ref, floor=floor)
+    detail["floor_source"] = src
+    detail["reference"] = prev_id
+    return status, detail
+
+
+def iteration(n: int, args) -> dict:
+    exp_id = f"loop{n:02d}_{int(time.time()) % 100000}"
+    _rule(f"ITERATION {n}   ({exp_id})")
+
+    # ---- 1. plan, with every previous result as context -------------------------
+    print("[orchestrator] reading feedback from previous iterations...", flush=True)
+    ctx = orchestrator.build_context()
+    print("\n".join("    | " + l for l in ctx.splitlines()[:40]), flush=True)
+    spec = orchestrator.propose()
+    print(f"\n[strategy] {spec['strategy_name']}")
+    print(f"  hypothesis : {spec['hypothesis']}")
+    print(f"  asks       : {spec['what_it_lets_the_model_ask']}")
+    print(f"  features   : {'; '.join(spec['feature_engineering'][:8])}")
+    print(f"  model      : {spec['model_family']} / {spec['key_hyperparameters']}")
+    print(f"  differs by : {spec['differs_from_previous']}")
+    print(f"  expects    : CV {spec['expected_cv_auc']}", flush=True)
+
+    ledger.record(
+        exp_id, family="loop", tier="full", status="running",
+        hypothesis=spec["hypothesis"],
+        what_it_lets_the_model_ask=spec["what_it_lets_the_model_ask"],
+        playbook_ref=spec["strategy_name"], spec=spec,
+    )
+
+    # ---- 2. write the code ------------------------------------------------------
+    print("\n[coder] writing plugin...", flush=True)
+    code = coder.write_plugin(spec)
+    print(f"    {len(code.splitlines())} lines", flush=True)
+
+    # ---- 3. preflight on a tiny subsample, repairing until it runs ---------------
+    # A broken plugin should cost ~15s to discover, not a full 691k-row training run.
+    ok, result, attempts, seen_errors = False, {}, 0, []
+    for attempt in range(args.repairs + 1):
+        attempts = attempt
+        label = "preflight" if attempt == 0 else f"preflight after repair {attempt}"
+        print(f"\n[sandbox] {label} ({PREFLIGHT_ROWS:,} rows)...", flush=True)
+        ok, result, _ = sandbox.execute(exp_id, code, timeout=600, rows=PREFLIGHT_ROWS)
+        if ok:
+            print(f"    preflight OK (auc {result['cv_auc']:.4f}, "
+                  f"{result['n_features']} features)", flush=True)
+            break
+        err = str(result.get("error", ""))
+        print("    FAILED:\n" + "\n".join("      " + l for l in err.splitlines()[:18]),
+              flush=True)
+        if attempt == args.repairs:
+            break
+        print(f"[repairer] attempt {attempt+1}/{args.repairs}...", flush=True)
+        code = coder.repair(code, err, spec, previous_errors=seen_errors)
+        seen_errors.append(err)
+
+    # ---- 3b. the real run on the frozen split -----------------------------------
+    if ok and not args.rows:
+        print("\n[sandbox] full run on the frozen 5-fold split...", flush=True)
+        ok, result, _ = sandbox.execute(exp_id, code, timeout=args.timeout)
+        if not ok:
+            err = str(result.get("error", ""))
+            print("    FAILED:\n" + "\n".join("      " + l for l in err.splitlines()[:18]),
+                  flush=True)
+
+    prev_id, prev_best = best_loop_run()
+
+    if not ok:
+        verdict = coder.critique(spec, result, prev_best)
+        ledger.record(exp_id, status="failed", verdict=verdict,
+                      repair_attempts=attempts,
+                      runtime_s=result.get("runtime_s"))
+        print(f"\n[verdict] {verdict}", flush=True)
+        return {"exp_id": exp_id, "ok": False, "verdict": verdict}
+
+    cv = result["cv_auc"]
+    delta = cv - prev_best
+    print(f"\n[result] CV AUC {cv:.6f}   (previous best {prev_best:.6f}, "
+          f"delta {delta:+.6f})   {result['runtime_s']:.0f}s", flush=True)
+
+    # ---- 3c. the promotion rule (SPEC 5.3), not a bare delta > 0 ----------------
+    status, det = judge(exp_id, cv, prev_id, prev_best, screening=bool(args.rows))
+    if status == "screening":
+        print("[judge]  SCREENING -- not on the frozen split, not judged, not stackable")
+    elif prev_id:
+        print(f"[judge]  {status.upper()}  vs {prev_id}: delta {det['delta']:+.6f} "
+              f"= {det['floors']:+.1f}x floor, P(improve) {det['p_improve']:.2f}")
+        print(f"         floor {det['floor']:.6f} [{det['floor_source']}], "
+              f"threshold {C.MIN_DELTA_FLOORS * det['floor']:+.6f}")
+    else:
+        print(f"[judge]  BASELINE (nothing to compare against yet)")
+
+    ledger.record(exp_id, status=status, cv_auc=cv, cv_std=result["cv_std"],
+                  delta_vs_best=delta, p_improve=det.get("p_improve"),
+                  runtime_s=result["runtime_s"], repair_attempts=attempts)
+
+    # ---- 4. submit and get real leaderboard feedback ----------------------------
+    lb = None
+    if args.submit and not args.rows:
+        from harness import submit as sub
+        print("\n[kaggle] submitting...", flush=True)
+        try:
+            lb = sub.submit(exp_id, message=f"{spec['strategy_name']} cv={cv:.6f}")
+        except Exception as e:
+            print(f"    submission failed: {e}", flush=True)
+    elif args.rows:
+        print("\n[kaggle] skipped (screening mode -- OOF is not on the frozen split)")
+    else:
+        print("\n[kaggle] skipped (--no-submit)")
+
+    # ---- 5. verdict -> becomes the next iteration's context --------------------
+    print("\n[critic] writing verdict...", flush=True)
+    verdict = coder.critique(spec, result, prev_best)
+    ledger.record(exp_id, verdict=verdict, actual_lb=lb)
+    print(f"[verdict] {verdict}", flush=True)
+
+    return {"exp_id": exp_id, "ok": True, "cv": cv, "lb": lb,
+            "delta": delta, "status": status, "verdict": verdict}
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--iterations", type=int, default=2)
+    p.add_argument("--repairs", type=int, default=3)
+    p.add_argument("--timeout", type=int, default=2400)
+    p.add_argument("--rows", type=int, default=None,
+                   help="train on the first N rows only (fast screening; disables submit)")
+    p.add_argument("--no-submit", dest="submit", action="store_false")
+    p.set_defaults(submit=True)
+    args = p.parse_args()
+
+    if not ollama.alive():
+        raise SystemExit("ollama is not reachable at localhost:11434 -- start it first")
+
+    _rule("AGENTIC AUTONOMOUS CLASSIFICATION")
+    print(f"  orchestrator : {ollama.ORCHESTRATOR}")
+    print(f"  coder        : {ollama.CODER}")
+    print(f"  iterations   : {args.iterations}")
+    print(f"  submit       : {args.submit and not args.rows}")
+    print(f"  best CV now  : {best_cv():.6f}")
+
+    # continue the numbering from what the ledger already holds, so a second invocation
+    # produces iteration 3, not another iteration 1
+    done = len(orchestrator.history())
+    results = []
+    for i in range(done + 1, done + args.iterations + 1):
+        try:
+            results.append(iteration(i, args))
+        except Exception:
+            traceback.print_exc()
+            results.append({"ok": False, "error": "loop-level exception"})
+        if (C.STATE / "PAUSE").exists():
+            print("\nPAUSE file present -- stopping.")
+            break
+
+    _rule("SUMMARY")
+    for i, r in enumerate(results, 1):
+        if r.get("ok"):
+            lb = f"{r['lb']:.5f}" if r.get("lb") else "—"
+            print(f"  {i}. {r['exp_id']:<18s} CV {r['cv']:.6f}  LB {lb}  "
+                  f"delta {r['delta']:+.6f}  [{r.get('status','?')}]")
+        else:
+            print(f"  {i}. {r.get('exp_id','?'):<18s} FAILED")
+    fl, src = measured_noise_floor()
+    print(f"\n  best CV overall: {best_cv():.6f}")
+    print(f"  noise floor    : {fl:.6f} [{src}]")
+
+    report.main()
+
+
+if __name__ == "__main__":
+    main()

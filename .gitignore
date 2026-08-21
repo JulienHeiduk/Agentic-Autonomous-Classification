@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+catboost_info/
+
+# Competition data — re-download with:
+#   kaggle competitions download -c playground-series-s6e8 -p data/
+data/
+
+# Loop state and outputs
+state/
+artifacts/
+external_oof/
+plugins/
+reports/
+ROADMAP.md
+BACKLOG.md
+
+# Symlink into .venv (streamlit ships its own skill)
+.claude/skills/

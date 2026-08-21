@@ -1,0 +1,174 @@
+"""Shared prompt material.
+
+Everything a small model needs in order to be useful here is stated explicitly. A 7-9B
+model will not infer the plugin contract, the column list, or the fact that the harness
+owns cross-validation -- so all three are spelled out every time.
+"""
+
+TASK = """\
+COMPETITION: Kaggle Playground S6E8 -- predict `addicted_label` (binary) from smartphone usage.
+METRIC: ROC AUC (ranking only -- calibration does not matter).
+DATA: train.csv 691,369 rows; test.csv 296,302 rows. Positive rate 0.709.
+
+COLUMNS
+  numeric (9):     age, daily_screen_time_hours, social_media_hours, gaming_hours,
+                   work_study_hours, sleep_hours, notifications_per_day,
+                   app_opens_per_day, weekend_screen_time
+  categorical (3): gender {Male,Female,Other}, stress_level {Low,Medium,High},
+                   academic_work_impact {Yes,No}
+  target:          addicted_label (0/1)   -- present in train only
+  id:              id                     -- present in both, NOT a feature
+
+EVERY column has 4%-19% missing values.
+
+MEASURED FACTS ABOUT THIS DATASET (verified, use them):
+  1. Generator invariant: daily_screen_time_hours = social_media_hours + gaming_hours
+     + work_study_hours + other, with other >= 0 and ZERO violations. The leftover
+     `resid = daily - (social + gaming + work)` is a real quantity.
+  2. notifications_per_day and app_opens_per_day are LOOKUP KEYS, not quantities.
+     Adjacent integer values differ in target rate by 0.22 on average. Treat them as
+     high-cardinality categories, not as magnitudes.
+  3. The first decimal digit of the hour columns swings the target rate by 8.5 points.
+     It is a generator fingerprint. floor(x*10) % 10 is a real feature.
+  4. Missingness is informative enough to be worth explicit flags (x.isna()).
+  5. Gradient-boosted trees handle NaN natively. If you impute, ADD the imputed column
+     next to the original -- replacing the NaN column makes results WORSE.
+"""
+
+CONTRACT = '''\
+PLUGIN CONTRACT -- your file must define exactly these two functions and nothing else at
+module level except imports and constants:
+
+    def make_features(train: pd.DataFrame, test: pd.DataFrame):
+        """train has the target column; test does not. Return (X_train, X_test)."""
+        return X_train, X_test
+
+    def make_model(seed: int):
+        """Return an UNFITTED sklearn-compatible estimator with .fit(X, y) and
+        .predict_proba(X)."""
+        return model
+
+RULES -- violating any of these fails the run:
+  * The harness owns cross-validation. DO NOT write a fold loop, DO NOT compute AUC,
+    DO NOT touch the target inside make_features. You never see y.
+  * Drop `id` and `addicted_label` from X_train. X_train and X_test must have IDENTICAL
+    column names in the same order.
+  * X_train must have exactly 691369 rows, X_test exactly 296302 rows. Never drop rows.
+  * The harness calls `model.fit(X, y)` with NO extra arguments. Your estimator must work
+    that way. You CANNOT pass cat_features, eval_set, early_stopping or sample weights at
+    fit time -- put everything in the constructor, and set a fixed n_estimators.
+  * Allowed imports ONLY: numpy, pandas, sklearn, lightgbm, xgboost, catboost, scipy,
+    math, itertools, collections, warnings, functools, re.
+    No os, sys, pathlib, open(), file I/O, or network.
+  * Return the model UNFITTED. make_model is called once per fold.
+
+NaN RULES -- EVERY COLUMN HAS 4%-19% MISSING VALUES. These are the errors that actually
+happen; read them before writing a line:
+  * `.astype(int)` / `.astype(np.int8)` on a column containing NaN RAISES
+    IntCastingNaNError. Keep such columns float, or `.fillna(-1)` FIRST and then cast.
+    e.g.  X["d1"] = (np.floor(X[c] * 10) % 10)              # float, has NaN -- fine
+    NOT   X["d1"] = (np.floor(X[c] * 10) % 10).astype(int)  # RAISES
+  * Comparisons and string ops on a column with NaN raise TypeError. Guard with .fillna().
+  * LightGBM, XGBoost and CatBoost all handle NaN natively. Leaving NaN in a numeric
+    column is the SAFE default -- you do not need to impute anything.
+
+CATEGORICAL COLUMNS -- USE EXACTLY THIS, ALWAYS. Do not use pandas `category` dtype and do
+not use LabelEncoder. Integer codes work identically for every engine, handle NaN, and
+guarantee train and test agree:
+
+    LEVELS = {"gender": ["Female", "Male", "Other"],
+              "stress_level": ["Low", "Medium", "High"],
+              "academic_work_impact": ["No", "Yes"]}
+
+    for c, lv in LEVELS.items():
+        X[c] = pd.Categorical(X[c], categories=lv).codes.astype(np.int8)   # NaN -> -1
+
+  Anything else -- `category` dtype without cat_features, LabelEncoder, get_dummies with
+  differing columns between train and test -- fails. This recipe does not.
+
+Reply with ONE fenced ```python block containing the complete file. No prose.
+'''
+
+ORCH_SYSTEM = """\
+You are the orchestrator of an autonomous Kaggle loop. You choose ONE strategy per \
+iteration, then a coder implements it and the harness measures it on a frozen 5-fold split.
+
+You are judged on whether each iteration is MEANINGFULLY DIFFERENT from the last and \
+whether it improves out-of-fold AUC. Repeating the previous iteration with a tweaked \
+learning rate is a wasted iteration.
+
+Respond with JSON only."""
+
+CODER_SYSTEM = """\
+You are a machine-learning engineer. You write one Python file implementing a strategy \
+given to you. The file must run correctly the first time -- there is no human to fix it.
+
+Write plain, defensive code. Prefer a small number of features that certainly work over a \
+large number that might not. Reply with one fenced python block and nothing else."""
+
+REPAIR_SYSTEM = """\
+You fix a Python file that failed. You are given the file and the exact traceback.
+
+Change as little as possible: fix the error, keep the strategy intact. Reply with one \
+fenced python block containing the COMPLETE corrected file, nothing else."""
+
+STRATEGY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strategy_name": {"type": "string"},
+        "hypothesis": {"type": "string"},
+        "what_it_lets_the_model_ask": {"type": "string"},
+        "feature_engineering": {"type": "array", "items": {"type": "string"}},
+        "model_family": {
+            "type": "string",
+            "enum": ["lightgbm", "xgboost", "catboost", "hist_gradient_boosting"],
+        },
+        "key_hyperparameters": {"type": "string"},
+        "differs_from_previous": {"type": "string"},
+        "expected_cv_auc": {"type": "number"},
+    },
+    "required": [
+        "strategy_name", "hypothesis", "what_it_lets_the_model_ask",
+        "feature_engineering", "model_family", "key_hyperparameters",
+        "differs_from_previous", "expected_cv_auc",
+    ],
+}
+
+EXAMPLE_PLUGIN = '''```python
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+NUMS = ["age", "daily_screen_time_hours", "social_media_hours", "gaming_hours",
+        "work_study_hours", "sleep_hours", "notifications_per_day",
+        "app_opens_per_day", "weekend_screen_time"]
+LEVELS = {"gender": ["Female", "Male", "Other"],
+          "stress_level": ["Low", "Medium", "High"],
+          "academic_work_impact": ["No", "Yes"]}
+
+
+def _fe(df):
+    X = df.drop(columns=["id", "addicted_label"], errors="ignore").copy()
+    for c in NUMS:
+        X[f"na_{c}"] = X[c].isna().astype(np.int8)
+    X["resid"] = X["daily_screen_time_hours"] - (
+        X["social_media_hours"] + X["gaming_hours"] + X["work_study_hours"])
+    # first decimal digit -- stays float because the column contains NaN
+    X["d1_daily"] = np.floor(X["daily_screen_time_hours"] * 10) % 10
+    for c, lv in LEVELS.items():
+        X[c] = pd.Categorical(X[c], categories=lv).codes.astype(np.int8)
+    return X
+
+
+def make_features(train, test):
+    X_train = _fe(train)
+    X_test = _fe(test)[X_train.columns]
+    return X_train, X_test
+
+
+def make_model(seed):
+    return lgb.LGBMClassifier(
+        n_estimators=800, learning_rate=0.05, num_leaves=63,
+        colsample_bytree=0.8, subsample=0.8, subsample_freq=1,
+        min_child_samples=100, random_state=seed, n_jobs=-1, verbose=-1)
+```'''
