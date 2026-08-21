@@ -23,8 +23,29 @@ def history():
         ).fetchall()
 
 
+FULL_DETAIL = 4   # most recent iterations replayed in full; older ones are one-liners
+
+
+def _is_comparable(status, cv):
+    """Only full-data runs on the frozen split can be compared to each other."""
+    return cv is not None and status not in ("screening", "failed", "running")
+
+
 def build_context() -> str:
-    """The feedback block handed to the next iteration."""
+    """The feedback block handed to the next iteration.
+
+    Two things this deliberately does NOT do, both learned the hard way:
+
+    It does not present a `screening` CV as if it were comparable. Those runs used --rows
+    on a subsample and are not on the frozen split. loop04 scored 0.9338 that way and its
+    verdict recorded a failure -- for CatBoost with ratio features, which is the family
+    loop10 later used to reach the best leaderboard score in the ledger. Replaying that
+    number unqualified argues against the approach that works.
+
+    It does not replay every iteration in full. The block grew ~600 tokens per iteration
+    and was already 38% of num_ctx at ten of them; left alone it crowds out the reasoning
+    and the answer, which is the truncation that returns empty content with no error.
+    """
     rows = history()
     if not rows:
         return (
@@ -35,34 +56,66 @@ def build_context() -> str:
             "Start with a solid, low-risk strategy that you are confident will run.\n"
         )
 
+    comparable = [(i, r) for i, r in enumerate(rows, 1) if _is_comparable(r[4], r[2])]
+    best_i = max(comparable, key=lambda t: t[1][2])[0] if comparable else None
+    detail_from = max(1, len(rows) - FULL_DETAIL + 1)
+
     out = [f"PREVIOUS ITERATIONS ({len(rows)} completed). Read these carefully.\n"]
-    best = max((r[2] for r in rows if r[2]), default=None)
+    summarised = 0
     for i, (eid, hyp, cv, lb, status, verdict, spec, rt) in enumerate(rows, 1):
-        out.append(f"--- iteration {i}: {eid} ---")
+        full = (i >= detail_from) or (i == best_i)
+        if not full:
+            summarised += 1
+            cv_s = f"CV {cv:.6f}" if _is_comparable(status, cv) else "no comparable CV"
+            out.append(f"--- iteration {i}: {eid} --- {status}, {cv_s} "
+                       f"-- {scrub(str(hyp or ''))[:110]}")
+            continue
+
+        out.append(f"--- iteration {i}: {eid} ---"
+                   + ("   <-- BEST SO FAR" if i == best_i else ""))
         out.append(f"  strategy   : {scrub(hyp)}")
         if spec:
-            import json
             try:
-                s = json.loads(spec)
-                if s.get("feature_engineering"):
+                sp = json.loads(spec)
+                if sp.get("feature_engineering"):
                     out.append("  features   : "
-                               + scrub('; '.join(s['feature_engineering'][:8])))
-                if s.get("model_family"):
-                    out.append(f"  model      : {s['model_family']} / "
-                               + scrub(str(s.get('key_hyperparameters', ''))))
+                               + scrub('; '.join(sp['feature_engineering'][:8])))
+                if sp.get("model_family"):
+                    out.append(f"  model      : {sp['model_family']} / "
+                               + scrub(str(sp.get('key_hyperparameters', ''))))
             except Exception:
                 pass
         out.append(f"  status     : {status}")
-        out.append(f"  CV AUC     : {cv:.6f}" if cv else "  CV AUC     : did not run")
+
+        if status == "screening":
+            out.append(f"  CV AUC     : {cv:.6f}  <-- SUBSAMPLE RUN (--rows), NOT on the "
+                       f"frozen split. NOT comparable to any other CV here. Treat this "
+                       f"iteration as UNMEASURED: it is not evidence for or against the "
+                       f"strategy." if cv else "  CV AUC     : did not run")
+        elif cv:
+            out.append(f"  CV AUC     : {cv:.6f}")
+        else:
+            out.append("  CV AUC     : did not run")
+
         out.append(f"  Kaggle LB  : {lb:.5f}" if lb else "  Kaggle LB  : not submitted")
         if rt:
             out.append(f"  runtime    : {rt:.0f}s")
         if verdict:
-            out.append(f"  VERDICT    : {scrub(verdict)}")
+            if status == "screening":
+                out.append(f"  VERDICT    : [written against a subsample score -- ignore any "
+                           f"judgement it makes about whether the strategy works] "
+                           f"{scrub(verdict)}")
+            else:
+                out.append(f"  VERDICT    : {scrub(verdict)}")
         out.append("")
 
-    if best:
-        out.append(f"BEST CV SO FAR: {best:.6f}")
+    if summarised:
+        out.insert(1, f"({summarised} older iterations condensed to one line each; the "
+                      f"best result and the {FULL_DETAIL} most recent are shown in full.)\n")
+
+    if comparable:
+        b = max(r[1][2] for r in comparable)
+        out.append(f"BEST CV SO FAR: {b:.6f}  (full-data runs on the frozen split only)")
     out.append(
         "\nYour job now: propose a strategy that is MEANINGFULLY DIFFERENT from every "
         "iteration above and that you expect to beat the best CV. Say plainly in "
