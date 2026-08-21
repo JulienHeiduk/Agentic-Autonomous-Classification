@@ -31,7 +31,7 @@ Requires Ollama running locally. Models used (both already installed):
 | Role | Model | Measured |
 |---|---|---|
 | Orchestrator / critic | `gpt-oss:20b` | 53–57 tok/s |
-| Coder / repairer | `qwen2.5:7b` | 47 tok/s |
+| Coder / repairer | `qwen2.5-coder:14b-instruct` | 29 tok/s |
 
 Loaded one at a time (`keep_alive=0`) — 24 GB of unified memory will not hold two models plus a
 training subprocess.
@@ -39,6 +39,31 @@ training subprocess.
 Swapping either model means checking its `think` setting first: the correct value differs per
 model, and the wrong one returns HTTP 200 with empty content rather than an error. The measured
 matrix and the per-model map are in `agents/ollama.py`.
+
+## A CV number is not a result
+
+`loop06` produced the best CV any iteration had reached — 0.962796 — and scored 0.93729 on the
+public leaderboard. A -0.0267 residual, against the +0.0005 the honest iterations produced.
+
+It had built a frequency encoding inside `make_features`, which the harness calls once per
+frame, so train and test got different mappings. Cross-validation only ever uses the train
+mapping, so CV could not see it. The promotion rule in `harness/config.py` compares CV deltas
+to a measured noise floor and promoted it cleanly — a rule built on CV cannot reject a plugin
+whose CV is the thing that is wrong.
+
+The harness now rejects that class of bug directly: every feature column is compared between
+`X_train` and `X_test` by population stability index before any fold is fitted. Honest features
+score ~0.0002 here; the two broken ones scored 0.064 and 0.069. It rejects `loop06` and passes
+`loop01`–`loop03` unchanged.
+
+Two encodings are supplied so plugins have no reason to build their own:
+
+| column | how it is built |
+|---|---|
+| `te_<key>` | target encoding, nested per outer fold, leak-free |
+| `freq_<key>` | frequency, fitted on train, applied to both frames |
+
+for `notifications_per_day` and `app_opens_per_day`. Full write-up in [`SPEC.md`](SPEC.md) §0b–0c.
 
 ## One iteration
 

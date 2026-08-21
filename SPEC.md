@@ -28,6 +28,71 @@ system: it can be disciplined about it in a way humans watching a live LB are no
 
 ---
 
+## 0b. Correction: public LB is the judge, and CV can lie (2026-08-21)
+
+`loop06` scored **CV 0.962796** — the best any loop iteration had produced — and **LB 0.93729**.
+A residual of **-0.0267**, where `loop01` and `loop02` had produced +0.0009 and +0.0005. It was
+not a better iteration. It was a broken one that CV could not see.
+
+**Cause.** The plugin built its own frequency encoding inside `make_features`:
+
+```python
+freq = df[c].value_counts(normalize=True).to_dict()
+X[c] = df[c].map(freq).fillna(0)
+```
+
+`make_features` is called once for `train` and once for `test`, so this fits a *different*
+mapping to each frame. The two mappings correlate at 0.9987 and differ in the 1e-4 range —
+harmless for a shallow model, fatal for the `max_depth=10, n_estimators=2000` XGBoost that
+plugin also chose, which carves splits at exactly that granularity. Cross-validation never
+sees the mismatch, because every fold uses the train mapping. The leaderboard sees it on the
+first submission.
+
+**This class of bug is invisible to the promotion rule in §5.3.** That rule compares CV deltas
+against a measured noise floor, and `loop06` passed it cleanly: +0.003 against a floor of
+0.000029, promoted. A rule built entirely on CV cannot reject a plugin whose CV is the thing
+that is wrong.
+
+**Fix.** Three changes, all in the harness rather than in prompts, because a rule the harness
+does not enforce is a rule the model ignores:
+
+1. **Train/test consistency gate** (`harness/encode.py:population_stability`,
+   `harness/plugin_runner.py:_check_consistency`). Every returned feature column is compared
+   between `X_train` and `X_test` by population stability index. `train` and `test` are iid
+   draws here, so an honestly-built feature scores ~0.0002; the two broken columns scored
+   0.064 and 0.069. Above `PSI_FAIL` the run is rejected with a message naming the columns.
+   Verified: rejects `loop06`, passes `loop01`–`loop03` unchanged.
+2. **The harness supplies the encodings** — `te_<key>` (out-of-fold target encoding) and
+   `freq_<key>` (fitted on train, applied to both frames) — so there is no reason to hand-roll
+   either. See §0c.
+3. **The contract states the rule** with the wrong and right form side by side.
+
+**What this does not fix.** The gate catches *inconsistent* features. It does not catch a
+plugin that is merely overfitted, and it does not make CV a substitute for the leaderboard.
+§0's discipline stands — optimise honest out-of-fold AUC — but `loop06` is the counterexample
+showing that "honest" is a property of the pipeline, not of the number.
+
+## 0c. Target encoding is supplied by the harness, not forbidden (2026-08-21)
+
+The plugin contract forbids touching `y` inside `make_features`, which made target encoding
+structurally impossible — while `xgb_te` and `lgb_te`, the two best experiments in the ledger
+at 0.9686, are both target encoding.
+
+Measured consequence: the orchestrator proposed target encoding in roughly **8 of every 10**
+strategies, and every one was unimplementable. That rate did not move when the prohibition was
+stated in the strategy prompt (6/6 violations), nor when it was repeated as a hard constraint
+in the system prompt (still 6/6), nor with rejection-and-resample (2/8 usable). It did not move
+because target encoding is the *correct* technique for a dataset whose lookup keys shift the
+target rate by 0.22 between adjacent values. Banning the right answer was the wrong fix.
+
+`harness/encode.py` now computes it and injects `te_<col>` before `make_features` runs. The
+plugin still never receives `y`. Encoding is **nested per outer fold** — inner out-of-fold for
+that fold's training rows, fitted-on-training-rows for the held-out and test rows — because a
+single global out-of-fold pass still leaks: a row in fold *j* encoded from "everything except
+fold *j*" carries fold *k*'s labels into fold *k*'s training set.
+
+After the change, `propose()` returns an implementable strategy **8/8**, up from 2/8.
+
 ## 1. Measured facts (all verified on this machine today)
 
 ### 1.1 Data
