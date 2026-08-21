@@ -75,6 +75,9 @@ def propose(model: str = None) -> dict:
         user,
         prompts.STRATEGY_SCHEMA,
         temperature=0.6,      # some spread, or every iteration proposes the same thing
-        num_predict=1200,
+        # Headroom, not a fit: a reasoning orchestrator spends most of this thinking
+        # before it emits a token of JSON, and 1200 was already marginal at 3 iterations
+        # of history. chat() doubles this on an empty response.
+        num_predict=4096,
     )
     return spec

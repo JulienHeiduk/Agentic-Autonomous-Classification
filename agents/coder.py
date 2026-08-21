@@ -69,5 +69,6 @@ def critique(spec: dict, result: dict, best_cv: float, model: str = None) -> str
     )
     return ollama.chat(
         model or ollama.ORCHESTRATOR, "You analyse ML experiment results tersely.",
-        user, temperature=0.3, num_predict=400,
+        # 400 left almost nothing after reasoning -- measured 391 of 400 used.
+        user, temperature=0.3, num_predict=1200,
     ).strip()

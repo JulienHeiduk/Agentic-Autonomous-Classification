@@ -30,11 +30,15 @@ Requires Ollama running locally. Models used (both already installed):
 
 | Role | Model | Measured |
 |---|---|---|
-| Orchestrator / critic | `qwen3.5:9b` | 39–44 tok/s |
-| Coder / repairer | `qwen2.5:7b` | 55–57 tok/s |
+| Orchestrator / critic | `gpt-oss:20b` | 53–57 tok/s |
+| Coder / repairer | `qwen2.5:7b` | 47 tok/s |
 
 Loaded one at a time (`keep_alive=0`) — 24 GB of unified memory will not hold two models plus a
 training subprocess.
+
+Swapping either model means checking its `think` setting first: the correct value differs per
+model, and the wrong one returns HTTP 200 with empty content rather than an error. The measured
+matrix and the per-model map are in `agents/ollama.py`.
 
 ## One iteration
 
