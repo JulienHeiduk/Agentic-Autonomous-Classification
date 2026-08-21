@@ -42,6 +42,11 @@ def roadmap() -> str:
         f"| Experiments | {n_exp} ({', '.join(f'{k}: {v}' for k, v in sorted(by_status.items()))}) |",
         f"| Submissions | {subs[0] or 0} total, best LB {subs[1] or 0:.5f}, {used_today} used today |",
         "",
+    ]
+
+    lines += loop_section()
+
+    lines += [
         "## Leaderboard reference (fetched 2026-08-21)", "",
         "| | AUC |", "|---|---|",
         "| Public #1 | 0.97140 |", "| Public #10 | 0.97123 |",
@@ -60,6 +65,59 @@ def roadmap() -> str:
     for name, done in phases:
         lines.append(f"- [{'x' if done else ' '}] {name}")
     return "\n".join(lines) + "\n"
+
+
+def loop_section() -> list:
+    """The loop's own trajectory, separated from everything a human wrote by hand.
+
+    ROADMAP's headline "Best CV" is taken over every family, so one strong tier0 result
+    hides what the loop itself is doing -- which is the number that actually tests whether
+    a recursive loop can do the ML. That comparison only means anything if the two sides
+    are kept apart, so this section reports the loop alone and states the delta explicitly.
+
+    `screening` rows ran under --rows on a subsample, are not on the frozen split, and are
+    therefore listed but excluded from every aggregate and from the step deltas.
+    """
+    rows = _q("SELECT exp_id, cv_auc, actual_lb, status, repair_attempts "
+              "FROM experiments WHERE family='loop' ORDER BY ts")
+    if not rows:
+        return ["## Loop", "", "No loop iterations yet.", ""]
+
+    judged = [r for r in rows if r[3] != "screening" and r[1] is not None]
+    hand = _q("SELECT exp_id, cv_auc FROM experiments "
+              "WHERE family='tier0' AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1")
+
+    out = ["## Loop", "",
+           "The loop's own experiments only. `screening` rows ran on a `--rows` subsample "
+           "and are excluded from the aggregates and deltas below.", ""]
+
+    if judged:
+        best_id, best_cv = max(((r[0], r[1]) for r in judged), key=lambda x: x[1])
+        needed_fix = sum(1 for r in rows if (r[4] or 0) > 0)
+        out += ["| | |", "|---|---|",
+                f"| Best loop CV | **{best_cv:.6f}** (`{best_id}`) |"]
+        if hand:
+            h_id, h_cv = hand[0]
+            out += [f"| Best hand-written CV | {h_cv:.6f} (`{h_id}`) |",
+                    f"| Loop − hand-written | **{best_cv - h_cv:+.6f}** |"]
+        out += [f"| Judged iterations | {len(judged)} of {len(rows)} |",
+                f"| Plugins needing repair | {needed_fix}/{len(rows)} "
+                f"({sum(r[4] or 0 for r in rows)} attempts) |", ""]
+
+    out += ["| # | iteration | CV | Δ prev | LB | status |",
+            "|---|---|---|---|---|---|"]
+    prev = None
+    for i, (eid, cv, lb, st, _) in enumerate(rows, 1):
+        if st == "screening" or cv is None or prev is None:
+            d = "—"
+        else:
+            d = f"{cv - prev:+.6f}"
+        out.append(f"| {i} | `{eid}` | {f'{cv:.6f}' if cv is not None else '—'} | {d} | "
+                   f"{f'{lb:.5f}' if lb else '—'} | {st} |")
+        if cv is not None and st != "screening":
+            prev = cv
+    out.append("")
+    return out
 
 
 def backlog() -> str:
