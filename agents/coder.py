@@ -64,8 +64,11 @@ def critique(spec: dict, result: dict, best_cv: float, model: str = None) -> str
         f"        {result['n_features']} features, {result['runtime_s']:.0f}s\n"
         f"        previous best CV was {best_cv:.6f} -> delta {delta:+.6f}\n"
         f"        the model expected {spec.get('expected_cv_auc')}\n\n"
+        f"{prompts.STRATEGY_CONSTRAINTS}\n\n"
         f"In 3 sentences: did it work, what is the most likely reason, and what should the "
-        f"NEXT iteration try differently? Be concrete and blunt. Plain text, no markdown."
+        f"NEXT iteration try differently? Be concrete and blunt. Plain text, no markdown. "
+        f"Your suggestion is read by the next orchestrator, so it must obey the "
+        f"constraints above -- never suggest target encoding or an out-of-fold scheme."
     )
     return ollama.chat(
         model or ollama.ORCHESTRATOR, "You analyse ML experiment results tersely.",

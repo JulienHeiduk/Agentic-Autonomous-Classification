@@ -5,6 +5,10 @@ The whole point of the loop lives in build_context(): iteration N's prompt conta
 iteration N-1's strategy, its measured CV, its leaderboard score and its verdict. The
 model is explicitly told what has already been tried so it searches somewhere new.
 """
+import json
+import re
+import unicodedata
+
 from agents import ollama, prompts
 from harness import ledger
 
@@ -35,15 +39,17 @@ def build_context() -> str:
     best = max((r[2] for r in rows if r[2]), default=None)
     for i, (eid, hyp, cv, lb, status, verdict, spec, rt) in enumerate(rows, 1):
         out.append(f"--- iteration {i}: {eid} ---")
-        out.append(f"  strategy   : {hyp}")
+        out.append(f"  strategy   : {scrub(hyp)}")
         if spec:
             import json
             try:
                 s = json.loads(spec)
                 if s.get("feature_engineering"):
-                    out.append(f"  features   : {'; '.join(s['feature_engineering'][:8])}")
+                    out.append("  features   : "
+                               + scrub('; '.join(s['feature_engineering'][:8])))
                 if s.get("model_family"):
-                    out.append(f"  model      : {s['model_family']} / {s.get('key_hyperparameters','')}")
+                    out.append(f"  model      : {s['model_family']} / "
+                               + scrub(str(s.get('key_hyperparameters', ''))))
             except Exception:
                 pass
         out.append(f"  status     : {status}")
@@ -52,7 +58,7 @@ def build_context() -> str:
         if rt:
             out.append(f"  runtime    : {rt:.0f}s")
         if verdict:
-            out.append(f"  VERDICT    : {verdict}")
+            out.append(f"  VERDICT    : {scrub(verdict)}")
         out.append("")
 
     if best:
@@ -66,18 +72,81 @@ def build_context() -> str:
     return "\n".join(out)
 
 
-def propose(model: str = None) -> dict:
+# Techniques that are still structurally impossible in a plugin.
+#
+# Target encoding used to be on this list and no longer is: the harness now computes it
+# out-of-fold and injects te_<col> columns before make_features runs (harness/encode.py).
+# That change was forced by measurement -- both gpt-oss:20b and qwen3.5:9b proposed target
+# encoding in roughly 8 of every 10 strategies, and no amount of prohibition moved the rate,
+# because it is the correct technique for a dataset whose lookup keys swing the target rate
+# by 0.22. Banning the right answer was the wrong fix.
+#
+# What remains impossible is stacking over out-of-fold PREDICTIONS: the plugin returns one
+# estimator and never sees another model's OOF matrix.
+_DASH = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
+FORBIDDEN = re.compile(
+    r"oof[ _-]?stack|stack(ing|ed)?[ _-]+(the[ _-]+)?oof|meta[ _-]?learner"
+    r"|pseudo[ _-]?label", re.I)
+
+
+def scrub(text: str) -> str:
+    """Redact impossible techniques from history before it is replayed.
+
+    The critic's verdicts are shown to the orchestrator every iteration, and one of them
+    recommends "hashed integers or target-encoded values". The orchestrator followed that
+    in 6/6 samples even with an explicit prohibition in ORCH_SYSTEM -- precedent from its
+    own history outweighs an instruction. Removing the advice is what actually works;
+    telling it louder does not.
+    """
+    if not text:
+        return text
+    return FORBIDDEN.sub("[removed: impossible here -- the feature step never sees y]", text)
+
+
+def forbidden_techniques(spec: dict) -> list:
+    """Impossible techniques named anywhere in a proposed strategy.
+
+    Normalises Unicode dashes first: models write "target-encoded" with U+2011 often
+    enough that an ASCII-only pattern silently reports a clean result.
+    """
+    blob = unicodedata.normalize("NFKC", json.dumps(spec, ensure_ascii=False))
+    return sorted({m.group(0).lower() for m in FORBIDDEN.finditer(blob.translate(_DASH))})
+
+
+def propose(model: str = None, tries: int = 4) -> dict:
+    """Propose the next strategy, rejecting any that cannot physically be implemented.
+
+    Rejection is cheap (~30s of generation) and the alternative is not: an impossible
+    strategy costs the coder's attempt plus every repair attempt plus a preflight run,
+    and still ends the iteration with no measurement in the ledger.
+    """
     ctx = build_context()
-    user = f"{prompts.TASK}\n\n{ctx}\n\nPropose the next strategy as JSON."
-    spec = ollama.chat_json(
-        model or ollama.ORCHESTRATOR,
-        prompts.ORCH_SYSTEM,
-        user,
-        prompts.STRATEGY_SCHEMA,
-        temperature=0.6,      # some spread, or every iteration proposes the same thing
-        # Headroom, not a fit: a reasoning orchestrator spends most of this thinking
-        # before it emits a token of JSON, and 1200 was already marginal at 3 iterations
-        # of history. chat() doubles this on an empty response.
-        num_predict=4096,
+    # The constraints come BEFORE the history so they are not buried under it.
+    base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n\n{ctx}\n\n"
+            f"Propose the next strategy as JSON.")
+    bad = []
+    for attempt in range(tries):
+        # Resample rather than appending a correction to the prompt: mutating the prompt
+        # mid-retry pushed gpt-oss into emitting one unterminated string, which then fails
+        # as invalid JSON at every budget. temperature=0.6 already gives enough spread.
+        spec = ollama.chat_json(
+            model or ollama.ORCHESTRATOR,
+            prompts.ORCH_SYSTEM,
+            base,
+            prompts.STRATEGY_SCHEMA,
+            temperature=0.6,  # some spread, or every iteration proposes the same thing
+            # Headroom, not a fit: a reasoning orchestrator spends most of this thinking
+            # before it emits a token of JSON, and 1200 was already marginal at 3
+            # iterations of history. chat() doubles this on empty or truncated output.
+            num_predict=4096,
+        )
+        bad = forbidden_techniques(spec)
+        if not bad:
+            return spec
+        print(f"    [rejected {attempt+1}/{tries}: proposes {', '.join(bad)} -- "
+              f"make_features never sees the target]", flush=True)
+    raise ollama.OllamaError(
+        f"orchestrator proposed an impossible technique {tries} times running "
+        f"(last: {', '.join(bad)}). The ledger history is likely steering it -- check "
+        f"whether old verdicts recommend target encoding."
     )
-    return spec
