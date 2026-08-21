@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/scripts/block-push.py",
+            "if": "Bash(git:*)",
+            "timeout": 10,
+            "statusMessage": "Checking push (blocked on all branches)..."
+          },
+          {
+            "type": "command",
+            "command": "python .claude/scripts/block-commit-main.py",
+            "if": "Bash(git:*)",
+            "timeout": 10,
+            "statusMessage": "Checking commit branch..."
+          },
+          {
+            "type": "command",
+            "command": "python .claude/scripts/block-branch-create.py",
+            "if": "Bash(git:*)",
+            "timeout": 10,
+            "statusMessage": "Checking for branch creation (blocked)..."
+          },
+          {
+            "type": "command",
+            "command": "python .claude/scripts/block-secrets.py",
+            "if": "Bash(git:*)",
+            "timeout": 10,
+            "statusMessage": "Scanning for secrets..."
+          },
+          {
+            "type": "command",
+            "command": "python .claude/scripts/block-gh-pr-create.py",
+            "if": "Bash(gh:*)",
+            "timeout": 10,
+            "statusMessage": "Checking for gh pr create (blocked)..."
+          }
+        ]
+      }
+    ]
+  }
+}
