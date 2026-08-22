@@ -33,6 +33,17 @@ MEASURED FACTS ABOUT THIS DATASET (verified, use them):
   4. Missingness is informative enough to be worth explicit flags (x.isna()).
   5. Gradient-boosted trees handle NaN natively. If you impute, ADD the imputed column
      next to the original -- replacing the NaN column makes results WORSE.
+
+PROVIDED FOR YOU -- the harness has ALREADY encoded the two lookup keys and put the results
+in `train` and `test` before you see them:
+
+     te_notifications_per_day     te_app_opens_per_day     (out-of-fold target encoding)
+     freq_notifications_per_day   freq_app_opens_per_day   (frequency, fitted on train)
+
+  Use them like any other numeric column. Do NOT rebuild either one. The te_ columns are
+  computed out-of-fold against the split you are scored on and are leak-free; the freq_
+  columns are fitted on train and applied to both frames, which is the part that is easy to
+  get wrong by hand.
 """
 
 CONTRACT = '''\
@@ -51,6 +62,19 @@ module level except imports and constants:
 RULES -- violating any of these fails the run:
   * The harness owns cross-validation. DO NOT write a fold loop, DO NOT compute AUC,
     DO NOT touch the target inside make_features. You never see y.
+  * `train` and `test` ALREADY CONTAIN `te_<key>` (out-of-fold target encoding) and
+    `freq_<key>` (train-fitted frequency) for notifications_per_day and app_opens_per_day.
+    Keep them in X -- they are there by default if you only drop `id` and `addicted_label`.
+    Never rebuild them.
+  * NEVER FIT A MAPPING INSIDE make_features. It is called ONCE for train and ONCE for test,
+    so anything fitted from the frame it is given -- `value_counts()`, a fitted encoder, a
+    per-frame mean or normalisation -- produces a DIFFERENT mapping for each frame. The run
+    is rejected if it does, because cross-validation cannot detect it and the leaderboard
+    can: one plugin scored CV 0.9628 and LB 0.9373 on exactly this.
+        WRONG:  freq = df[c].value_counts(normalize=True); X[c] = df[c].map(freq)
+        RIGHT:  use the provided freq_<c> column.
+  * `te_` and `freq_` are RESERVED prefixes belonging to the harness. Use those columns, and
+    derive from them freely, but do not name a feature of your own with either prefix.
   * Drop `id` and `addicted_label` from X_train. X_train and X_test must have IDENTICAL
     column names in the same order.
   * X_train must have exactly 691369 rows, X_test exactly 296302 rows. Never drop rows.
@@ -89,6 +113,44 @@ guarantee train and test agree:
 Reply with ONE fenced ```python block containing the complete file. No prose.
 '''
 
+STRATEGY_CONSTRAINTS = """\
+WHAT A STRATEGY MAY ASSUME -- the plugin contract, stated in strategy terms.
+
+A coder turns your strategy into exactly two functions, make_features(train, test) and
+make_model(seed). The harness owns everything else: the fold split, the fitting, the
+scoring, the submission. That rules some techniques IN and others OUT. Proposing an OUT
+technique wastes the entire iteration -- no coder can implement it, at any size, and the
+run fails instead of producing a measurement.
+
+OUT -- never propose these:
+  * Computing target encoding YOURSELF, or any other target statistic, inside the plugin.
+    Not because it is a bad idea -- it is a good one -- but because the harness has already
+    done it for you (see IN below) and the feature step is never given y.
+  * A fold loop, OOF stacking over other models' predictions, a meta-learner, or computing
+    AUC inside the plugin. The harness owns the 5-fold split and the scoring.
+  * Early stopping, eval_set, sample weights, or cat_features passed at fit time. The
+    harness calls model.fit(X, y) with no extra arguments, so everything must live in the
+    estimator's constructor with a fixed n_estimators.
+  * Pseudo-labelling or anything requiring the test labels.
+
+IN -- all of these work:
+  * TARGET ENCODING and FREQUENCY ENCODING, already built and supplied: `te_<key>` and
+    `freq_<key>` for both lookup keys are in the data before the plugin runs. Propose
+    strategies that USE them -- interactions, binning, combining with the raw keys. Do not
+    propose creating them, and never propose a feature fitted separately on train and test:
+    that produces a CV that does not survive the leaderboard, and the run is rejected.
+  * Any feature computed from the feature columns alone: arithmetic, ratios, residuals,
+    digit extraction, binning, value counts, missingness flags, interactions.
+  * Any single estimator from sklearn, lightgbm, xgboost or catboost, configured entirely
+    in its constructor.
+  * An ensemble, but ONLY as one sklearn-compatible object -- e.g.
+    VotingClassifier(estimators=[...], voting="soft"). Never a tuple or list of models:
+    the harness calls .fit on whatever make_model returns. If you propose an ensemble,
+    name VotingClassifier explicitly so the coder builds it correctly.
+  * Preprocessing, as long as the whole thing is returned as a single sklearn Pipeline.
+"""
+
+
 ORCH_SYSTEM = """\
 You are the orchestrator of an autonomous Kaggle loop. You choose ONE strategy per \
 iteration, then a coder implements it and the harness measures it on a frozen 5-fold split.
@@ -96,6 +158,11 @@ iteration, then a coder implements it and the harness measures it on a frozen 5-
 You are judged on whether each iteration is MEANINGFULLY DIFFERENT from the last and \
 whether it improves out-of-fold AUC. Repeating the previous iteration with a tweaked \
 learning rate is a wasted iteration.
+
+Target encoding of the two lookup keys is ALREADY DONE for you: `te_notifications_per_day` \
+and `te_app_opens_per_day` arrive in the data, computed out-of-fold by the harness. Build on \
+them rather than proposing to create them, and never propose computing target statistics \
+inside the plugin -- the feature step is not given the target column.
 
 Respond with JSON only."""
 

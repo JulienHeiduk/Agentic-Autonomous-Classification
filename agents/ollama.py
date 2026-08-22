@@ -5,14 +5,20 @@ Two things measured on this machine that the rest of the code depends on:
   * JSON-schema-constrained output works and is what makes a 7-9B model reliable enough to
     sit inside an unattended loop.
   * The correct `think` setting is PER MODEL, and getting it wrong returns 200 OK with an
-    empty message.content -- no error, no warning, tokens billed against num_predict.
-    Measured on both paths (`format` given vs plain text):
+    empty message.content -- no error, no warning. When that happens the tokens went to
+    message.thinking instead and done_reason is 'length': the model reasoned until it ran
+    out of room and never opened the final channel. eval_count does NOT include those
+    thinking tokens, so the response looks far under budget while it is in fact truncating.
 
-                     think=False              think key omitted
-        qwen3.5:9b   ok on both paths         EMPTY on the plain-text path
-        gpt-oss:20b  EMPTY with `format`      ok on both paths
+    Measured on the orchestrator's schema-constrained call, n=8 per cell:
 
-    There is no single value that is correct for both, hence THINK/_think_for below.
+                     think=False    think omitted   think="low"
+        qwen3.5:9b   8/8            EMPTY (plain)   n/a
+        gpt-oss:20b  EMPTY          2/8             8/8
+
+    There is no single value correct for both, hence THINK/_think_for below. Note the
+    2/8: this failure is intermittent, so a one- or two-sample check will pass a setting
+    that then fails in the loop. Qualify any new model at n>=8 on this exact call.
 
 Models are loaded one at a time (keep_alive=0). This machine has 24 GB of unified memory
 and the training subprocess needs 4-8 GB of it, so two resident models plus a fit is not
@@ -26,12 +32,18 @@ import urllib.request
 HOST = "http://localhost:11434"
 
 ORCHESTRATOR = "gpt-oss:20b"    # 55-56 tok/s vs qwen3.5:9b's 38, schema-complete JSON
-CODER = "qwen2.5:7b"            # 47 tok/s; qwen3-coder:30b matched its AUC within noise
+CODER = "qwen2.5-coder:14b-instruct"   # 5/5 clean first drafts vs qwen2.5:7b's 1/5
+                                       # on a stacked-ensemble strategy (n=5 each)
 
 # Which models need `think` sent, and with what value. None == omit the key entirely.
-# The default is False because that is correct for every Qwen and Gemma tag here; only
-# gpt-oss needs the key absent. See the module docstring for the measurements.
-THINK = {"gpt-oss": None}
+# The default is False because that is correct for every Qwen and Gemma tag here; gpt-oss
+# takes a reasoning-effort string instead. See the module docstring for the measurements.
+#
+# gpt-oss MUST be "low" and not omitted: left at its default effort it spends generation on
+# the reasoning channel and emits no final answer, measured at 2/8 usable responses on the
+# orchestrator's schema-constrained call. "low" measured 8/8. Two samples are not enough to
+# qualify a setting here -- the failure is intermittent, so it hides at small n.
+THINK = {"gpt-oss": "low"}
 DEFAULT_THINK = False
 
 
@@ -73,7 +85,7 @@ def alive() -> bool:
 
 def chat(model: str, system: str, user: str, schema: dict = None,
          temperature: float = 0.2, num_predict: int = 4096,
-         keep_alive: int = 0, retries: int = 2) -> str:
+         keep_alive: int = 0, retries: int = 2, num_ctx: int = 16384) -> str:
     """One turn. Returns message content. If `schema` is given the content is valid JSON."""
     payload = {
         "model": model,
@@ -83,7 +95,14 @@ def chat(model: str, system: str, user: str, schema: dict = None,
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "options": {"temperature": temperature, "num_predict": num_predict},
+        # num_ctx is the whole window: prompt + thinking + answer. Ollama defaults it
+        # to 4096, and build_context() grows every iteration -- at ~3300 prompt tokens
+        # that left ~800 for the answer and the JSON truncated mid-string, reported as
+        # done_reason 'length' at an eval_count far below num_predict. Raising
+        # num_predict cannot fix it; num_ctx is the binding limit. Measured on the
+        # orchestrator call: 0/4 valid JSON at the default, 4/4 at 16384.
+        "options": {"temperature": temperature, "num_predict": num_predict,
+                    "num_ctx": num_ctx},
     }
     think = _think_for(model)    # per model -- see module docstring
     if think is not None:
@@ -93,6 +112,10 @@ def chat(model: str, system: str, user: str, schema: dict = None,
 
     last = None
     npred = num_predict
+    # Escalation helps a genuinely truncated answer and does nothing for a model stuck
+    # emitting one runaway string -- which looks identical from here. Cap it so the
+    # useless case costs seconds rather than minutes.
+    npred_cap = max(num_predict * 4, 8192)
     for attempt in range(retries + 1):
         payload["options"]["num_predict"] = npred
         t0 = time.time()
@@ -103,20 +126,27 @@ def chat(model: str, system: str, user: str, schema: dict = None,
         print(f"    [{model} {tok} tok, {tok/dur:.0f} tok/s, {time.time()-t0:.0f}s]")
 
         if not content:
-            # A reasoning model that spent the whole budget thinking returns 200 OK with
-            # empty content, and will do it again at the same budget -- so retrying the
-            # identical request cannot succeed. Reasoning length also grows with the
-            # context, and build_context() grows every iteration, so any fixed ceiling is
-            # only ever temporarily large enough. Escalate instead of repeating.
-            last = (f"empty content at num_predict={npred} -- budget spent reasoning, or "
-                    f"wrong `think` for {model} (sent think={think!r}); see THINK")
-            npred *= 2
+            # The generation went to message.thinking and the final channel never opened.
+            # The fix is the `think` setting (see THINK), not the budget -- but a wrong
+            # setting is not the only way to get here, so give the next attempt more room
+            # rather than re-sending an identical request that already failed.
+            think_chars = len(((r.get("message") or {}).get("thinking") or ""))
+            last = (f"empty content at num_predict={npred} "
+                    f"(thinking={think_chars} chars, done_reason="
+                    f"{r.get('done_reason')!r}) -- wrong `think` for {model}? "
+                    f"sent think={think!r}; see THINK")
+            npred = min(npred * 2, npred_cap)
             continue
         if schema:
             try:
                 json.loads(content)
             except json.JSONDecodeError as e:
-                last = f"invalid JSON: {e}"
+                # Almost always truncation, not malformed generation: the schema forces
+                # well-formed JSON, so the usual way it fails to parse is running out of
+                # budget mid-string. Same escalation as the empty case, same reason --
+                # retrying at an identical budget cannot fix a length problem.
+                last = f"invalid JSON at num_predict={npred}: {e}"
+                npred = min(npred * 2, npred_cap)
                 continue
         return content
     raise OllamaError(f"{model} failed after {retries+1} attempts: {last}")

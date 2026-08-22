@@ -89,8 +89,13 @@ def offset_fit():
     A linear fit was 8x more accurate than a constant on 12 reference submissions."""
     with ledger.conn() as c:
         rows = c.execute(
+            # Rejected experiments are excluded: a member is rejected precisely when its
+            # CV did not mean what it claimed, so including it fits the line to a point
+            # whose x-coordinate is wrong. loop06 (CV 0.9628 -> LB 0.9373) dragged the
+            # prediction for loop10 down to 0.92239 against an actual 0.96621.
             "SELECT e.cv_auc, s.public_lb FROM submissions s JOIN experiments e "
-            "ON e.exp_id=s.exp_id WHERE s.public_lb IS NOT NULL AND e.cv_auc IS NOT NULL"
+            "ON e.exp_id=s.exp_id WHERE s.public_lb IS NOT NULL AND e.cv_auc IS NOT NULL "
+            "AND e.status != 'rejected'"
         ).fetchall()
     if len(rows) < 3:
         return None

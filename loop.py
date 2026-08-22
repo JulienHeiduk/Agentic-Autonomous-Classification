@@ -95,7 +95,15 @@ def iteration(n: int, args) -> dict:
     # ---- 1. plan, with every previous result as context -------------------------
     print("[orchestrator] reading feedback from previous iterations...", flush=True)
     ctx = orchestrator.build_context()
-    print("\n".join("    | " + l for l in ctx.splitlines()[:40]), flush=True)
+    lines = ctx.splitlines()
+    shown = lines[:40]
+    print("\n".join("    | " + l for l in shown), flush=True)
+    if len(lines) > len(shown):
+        # Say so. Silently showing less than the model receives hides exactly the kind of
+        # bad row you would want to catch by eye -- a screening CV replayed as if it were
+        # comparable sat unseen below this cut for six iterations.
+        print(f"    | ... {len(lines) - len(shown)} more lines sent to the model but not "
+              f"printed ({len(ctx)} chars total)", flush=True)
     spec = orchestrator.propose()
     print(f"\n[strategy] {spec['strategy_name']}")
     print(f"  hypothesis : {spec['hypothesis']}")
