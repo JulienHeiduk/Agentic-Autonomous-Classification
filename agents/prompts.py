@@ -241,11 +241,16 @@ STRATEGY_SCHEMA = {
         "key_hyperparameters": {"type": "string"},
         "differs_from_previous": {"type": "string"},
         "expected_cv_auc": {"type": "number"},
+        # Which curated idea this implements. The enum is injected at call time from the
+        # queued backlog (see orchestrator.strategy_schema), so the model must PICK from
+        # the playbook rather than describe whatever the context already shows. Free-text
+        # novelty checks were tried first and paraphrases walked straight through them.
+        "playbook_ref": {"type": "string"},
     },
     "required": [
         "strategy_name", "hypothesis", "what_it_lets_the_model_ask",
         "feature_engineering", "model_family", "key_hyperparameters",
-        "differs_from_previous", "expected_cv_auc",
+        "differs_from_previous", "expected_cv_auc", "playbook_ref",
     ],
 }
 

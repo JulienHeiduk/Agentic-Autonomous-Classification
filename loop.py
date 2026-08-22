@@ -174,7 +174,7 @@ def iteration(n: int, args) -> dict:
         exp_id, family="loop", tier="full", status="running",
         hypothesis=spec["hypothesis"],
         what_it_lets_the_model_ask=spec["what_it_lets_the_model_ask"],
-        playbook_ref=spec["strategy_name"], spec=spec,
+        playbook_ref=spec.get("playbook_ref") or "other", spec=spec,
     )
 
     # ---- 2. write the code ------------------------------------------------------

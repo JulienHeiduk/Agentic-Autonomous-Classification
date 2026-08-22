@@ -5,6 +5,7 @@ The whole point of the loop lives in build_context(): iteration N's prompt conta
 iteration N-1's strategy, its measured CV, its leaderboard score and its verdict. The
 model is explicitly told what has already been tried so it searches somewhere new.
 """
+import difflib
 import json
 import re
 import unicodedata
@@ -191,6 +192,145 @@ def forbidden_techniques(spec: dict) -> list:
     return sorted({m.group(0).lower() for m in FORBIDDEN.finditer(blob.translate(_DASH))})
 
 
+BACKLOG_QUEUED = 6      # ideas offered per prompt
+BACKLOG_REJECTED = 8    # dead ends listed so they are not rediscovered
+
+
+def backlog_block() -> str:
+    """The curated search space, which the orchestrator could not previously see.
+
+    harness/seed.py writes these from SPEC 3.3 -- priority-ordered, each with a measured
+    reason -- and build_context() never read the table. The consequence was measurable:
+    nine of ten iterations proposed the same idea (treating the lookup keys as categorical)
+    while `public_oof_pool`, the highest-priority entry in the playbook, was never proposed
+    once. A searcher with no menu re-samples whatever is already in front of it.
+
+    The rejected entries matter as much as the queued ones: SPEC 3.3 exists so the loop does
+    not spend iterations rediscovering dead ends someone already measured.
+    """
+    with ledger.conn() as c:
+        queued = c.execute(
+            "SELECT idea_id, family, priority, expected_gain, rationale FROM backlog "
+            "WHERE status='queued' ORDER BY priority DESC LIMIT ?", (BACKLOG_QUEUED,)
+        ).fetchall()
+        rejected = c.execute(
+            "SELECT idea_id, rationale FROM backlog WHERE status='rejected' "
+            "ORDER BY priority DESC LIMIT ?", (BACKLOG_REJECTED,)
+        ).fetchall()
+    if not queued and not rejected:
+        return ""
+
+    out = ["", "=== CURATED IDEA LIST (the search space, priority-ordered) ===",
+           "These were written from measured community results, not guessed. Prefer one of",
+           "them over inventing a variation of what the last iteration already did.", ""]
+    for idea, fam, pri, gain, why in queued:
+        g = f", expected {gain:+.5f}" if gain is not None else ""
+        out.append(f"  [{pri:>3}] {idea} ({fam}{g})")
+        out.append(f"        {_clip(str(why or ''), 200)}")
+    if rejected:
+        out += ["", "ALREADY MEASURED AND REJECTED -- do not propose these:"]
+        for idea, why in rejected:
+            out.append(f"  x {idea}: {_clip(str(why or ''), 150)}")
+    out.append("")
+    return "\n".join(out)
+
+
+NOVELTY_MAX = 0.5       # Jaccard overlap of content words above which it is a repeat
+STOPWORDS = frozenset("""the a an and or of to in on for with as by is are be will can
+that this it its from at into than then so we our using use used already more most very
+model models feature features column columns key keys data set sets run runs iteration
+should would could may might because since while when where which what how also both each
+new better best improve improves improving performance signal""".split())
+
+
+def _tokens(spec) -> set:
+    """Content words of a strategy, for overlap comparison."""
+    return {w for w in _fingerprint(spec).split() if len(w) > 2 and w not in STOPWORDS}
+
+
+def _fingerprint(spec_or_row) -> str:
+    """The comparable content of a strategy: what it builds and what it fits."""
+    if isinstance(spec_or_row, dict):
+        parts = [str(spec_or_row.get("hypothesis", "")),
+                 "; ".join(spec_or_row.get("feature_engineering", []) or []),
+                 str(spec_or_row.get("model_family", ""))]
+    else:
+        parts = [str(spec_or_row or "")]
+    t = " ".join(parts).lower()
+    return re.sub(r"[^a-z0-9 ]+", " ", t)
+
+
+def too_similar(spec: dict):
+    """(exp_id, ratio) of a past iteration this strategy repeats, or None.
+
+    The prompt has asked for a MEANINGFULLY DIFFERENT strategy from the start, and nine of
+    ten iterations still proposed treating the lookup keys as categorical -- the CV spread
+    across all of them was 0.0018, which is sampling noise around one idea rather than a
+    search. Instructions lose to the precedent sitting in the context; forbidden_techniques
+    showed that a code-level check is what actually holds.
+    """
+    new = _tokens(spec)
+    if not new:
+        return None
+    worst = None
+    for eid, hyp, cv, lb, status, verdict, spec_json, rt in history():
+        prev = None
+        if spec_json:
+            try:
+                prev = _tokens(json.loads(spec_json))
+            except Exception:
+                prev = None
+        if not prev:
+            prev = _tokens({"hypothesis": hyp})
+        if not prev:
+            continue
+        # Jaccard on content words. difflib was tried first and is the wrong tool: it
+        # matches character runs, so a reworded version of the same idea scored 0.04-0.06
+        # against a 0.62 threshold and sailed through. Overlap of concepts is what "already
+        # tried" actually means, and it does not care about sentence length or word order.
+        r = len(new & prev) / max(len(new | prev), 1)
+        if r >= NOVELTY_MAX and (worst is None or r > worst[1]):
+            worst = (eid, r)
+    return worst
+
+
+def _used_refs() -> set:
+    with ledger.conn() as c:
+        return {r[0] for r in c.execute(
+            "SELECT playbook_ref FROM experiments WHERE family='loop' "
+            "AND playbook_ref IS NOT NULL")}
+
+
+def strategy_schema() -> dict:
+    """STRATEGY_SCHEMA with playbook_ref constrained to the ideas still on the menu.
+
+    A schema enum is enforced by the decoder, so this is the one instruction the model
+    cannot paraphrase its way around -- which is what both text-similarity guards failed to
+    do. `other` stays available so a genuinely new idea is still possible.
+    """
+    import copy
+    with ledger.conn() as c:
+        ids = [r[0] for r in c.execute(
+            "SELECT idea_id FROM backlog WHERE status='queued' ORDER BY priority DESC")]
+        used = {r[0] for r in c.execute(
+            "SELECT playbook_ref FROM experiments WHERE family='loop' "
+            "AND playbook_ref IS NOT NULL")}
+    fresh = [i for i in ids if i not in used]
+    schema = copy.deepcopy(prompts.STRATEGY_SCHEMA)
+    schema["properties"]["playbook_ref"]["enum"] = (fresh or ids) + ["other"]
+    return schema
+
+
+def unused_playbook_refs() -> list:
+    with ledger.conn() as c:
+        ids = [r[0] for r in c.execute(
+            "SELECT idea_id FROM backlog WHERE status='queued' ORDER BY priority DESC")]
+        used = {r[0] for r in c.execute(
+            "SELECT playbook_ref FROM experiments WHERE family='loop' "
+            "AND playbook_ref IS NOT NULL")}
+    return [i for i in ids if i not in used]
+
+
 def propose(model: str = None, tries: int = 4) -> dict:
     """Propose the next strategy, rejecting any that cannot physically be implemented.
 
@@ -200,7 +340,8 @@ def propose(model: str = None, tries: int = 4) -> dict:
     """
     ctx = build_context()
     # The constraints come BEFORE the history so they are not buried under it.
-    base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n\n{ctx}\n\n"
+    base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n"
+            f"{backlog_block()}\n{ctx}\n\n"
             f"Propose the next strategy as JSON.")
     bad = []
     for attempt in range(tries):
@@ -211,7 +352,7 @@ def propose(model: str = None, tries: int = 4) -> dict:
             model or ollama.ORCHESTRATOR,
             prompts.ORCH_SYSTEM,
             base,
-            prompts.STRATEGY_SCHEMA,
+            strategy_schema(),
             temperature=0.6,  # some spread, or every iteration proposes the same thing
             # Headroom, not a fit: a reasoning orchestrator spends most of this thinking
             # before it emits a token of JSON, and 1200 was already marginal at 3
@@ -219,10 +360,22 @@ def propose(model: str = None, tries: int = 4) -> dict:
             num_predict=4096,
         )
         bad = forbidden_techniques(spec)
-        if not bad:
-            return spec
-        print(f"    [rejected {attempt+1}/{tries}: proposes {', '.join(bad)} -- "
-              f"make_features never sees the target]", flush=True)
+        if bad:
+            print(f"    [rejected {attempt+1}/{tries}: proposes {', '.join(bad)} -- "
+                  f"make_features never sees the target]", flush=True)
+            continue
+        ref = spec.get("playbook_ref")
+        if ref and ref != "other" and ref in _used_refs() and attempt < tries - 1:
+            print(f"    [rejected {attempt+1}/{tries}: playbook_ref '{ref}' already "
+                  f"used -- pick an idea that has not been tried]", flush=True)
+            continue
+        dup = too_similar(spec)
+        if dup and attempt < tries - 1:
+            # Not on the last attempt: a repeat still beats no strategy at all.
+            print(f"    [rejected {attempt+1}/{tries}: {dup[1]:.0%} similar to "
+                  f"{dup[0]} -- already tried]", flush=True)
+            continue
+        return spec
     raise ollama.OllamaError(
         f"orchestrator proposed an impossible technique {tries} times running "
         f"(last: {', '.join(bad)}). The ledger history is likely steering it -- check "
