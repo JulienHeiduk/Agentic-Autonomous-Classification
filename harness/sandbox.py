@@ -168,7 +168,8 @@ def _timeout_error(timeout: int, rows) -> str:
             "  * cut n_estimators / iterations hard (e.g. 6000 -> 600, 2000 -> 400)",
             "  * cut depth / max_depth (e.g. 10 -> 6)",
             "  * if you built an ensemble of several models, keep ONE of them",
-            "  * drop any n_jobs/thread_count above 8",
+            "  * make sure the estimator uses every core: n_jobs=-1, or "
+            "thread_count=-1 for CatBoost -- a single-threaded fit is needlessly slow",
             "",
             "Change ONLY those numbers. Do not add features, do not change the algorithm.",
         ]

@@ -85,6 +85,12 @@ RULES -- violating any of these fails the run:
     math, itertools, collections, warnings, functools, re.
     No os, sys, pathlib, open(), file I/O, or network.
   * Return the model UNFITTED. make_model is called once per fold.
+  * USE EVERY CORE. This machine has 15. Say so explicitly in the constructor:
+        LightGBM / XGBoost / sklearn   ->  n_jobs=-1
+        CatBoost                       ->  thread_count=-1
+    A library default, or a hardcoded number like n_jobs=8, leaves most of the machine
+    idle and makes every fold slower for no benefit. No LLM is resident while your plugin
+    runs, so the whole machine is yours.
   * KEEP THE MODEL CHEAP ENOUGH TO SMOKE-TEST. Before the real run, the harness fits your
     plugin on 8,000 rows with a 120s budget. A sane configuration finishes that in seconds.
     n_estimators/iterations in the low thousands with depth 10, or an ensemble of several
@@ -153,6 +159,10 @@ IN -- all of these work:
     the harness calls .fit on whatever make_model returns. If you propose an ensemble,
     name VotingClassifier explicitly so the coder builds it correctly.
   * Preprocessing, as long as the whole thing is returned as a single sklearn Pipeline.
+
+PARALLELISM -- the machine has 15 cores and nothing else runs while a plugin trains. Any
+estimator you name should use all of them (n_jobs=-1, or thread_count=-1 for CatBoost).
+Do not put a hardcoded thread count like thread_count=8 in `key_hyperparameters`.
 
 BUDGET -- every plugin is smoke-tested on 8,000 rows with a 120s budget before the real run.
 Keep `key_hyperparameters` within that: n_estimators/iterations in the hundreds to ~1500 and
