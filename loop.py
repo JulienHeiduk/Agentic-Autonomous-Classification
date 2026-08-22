@@ -30,6 +30,11 @@ from harness.data import load
 
 
 PREFLIGHT_ROWS = 8000
+# 8,000 rows is seconds of work for any sane configuration, so a long ceiling here buys
+# nothing and costs a great deal: a plugin that picks 6000 CatBoost iterations at depth 10
+# blows any budget, and each repair attempt pays it again. At --repairs 3 a 600s ceiling
+# spent 40 minutes to learn the same thing 120s learns.
+PREFLIGHT_TIMEOUT = 120
 
 
 def _rule(txt=""):
@@ -132,7 +137,8 @@ def iteration(n: int, args) -> dict:
         attempts = attempt
         label = "preflight" if attempt == 0 else f"preflight after repair {attempt}"
         print(f"\n[sandbox] {label} ({PREFLIGHT_ROWS:,} rows)...", flush=True)
-        ok, result, _ = sandbox.execute(exp_id, code, timeout=600, rows=PREFLIGHT_ROWS)
+        ok, result, _ = sandbox.execute(exp_id, code, timeout=PREFLIGHT_TIMEOUT,
+                                        rows=PREFLIGHT_ROWS)
         if ok:
             print(f"    preflight OK (auc {result['cv_auc']:.4f}, "
                   f"{result['n_features']} features)", flush=True)

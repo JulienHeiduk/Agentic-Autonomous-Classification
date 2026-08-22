@@ -85,6 +85,11 @@ RULES -- violating any of these fails the run:
     math, itertools, collections, warnings, functools, re.
     No os, sys, pathlib, open(), file I/O, or network.
   * Return the model UNFITTED. make_model is called once per fold.
+  * KEEP THE MODEL CHEAP ENOUGH TO SMOKE-TEST. Before the real run, the harness fits your
+    plugin on 8,000 rows with a 120s budget. A sane configuration finishes that in seconds.
+    n_estimators/iterations in the low thousands with depth 10, or an ensemble of several
+    such models, blows it -- and a timeout gives the repairer no traceback to work from.
+    Prefer n_estimators <= 1500 and depth <= 8 unless the strategy explicitly needs more.
 
 NaN RULES -- EVERY COLUMN HAS 4%-19% MISSING VALUES. These are the errors that actually
 happen; read them before writing a line:
@@ -148,6 +153,11 @@ IN -- all of these work:
     the harness calls .fit on whatever make_model returns. If you propose an ensemble,
     name VotingClassifier explicitly so the coder builds it correctly.
   * Preprocessing, as long as the whole thing is returned as a single sklearn Pipeline.
+
+BUDGET -- every plugin is smoke-tested on 8,000 rows with a 120s budget before the real run.
+Keep `key_hyperparameters` within that: n_estimators/iterations in the hundreds to ~1500 and
+depth <= 8 is ample here. Proposing 6000 iterations at depth 10 does not buy accuracy on this
+dataset; it spends the iteration on a timeout that produces no measurement at all.
 """
 
 
