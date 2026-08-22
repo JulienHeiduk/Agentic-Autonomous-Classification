@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import time
 import traceback
 
@@ -53,6 +54,22 @@ def best_loop_run():
             "AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1"
         ).fetchone()
     return (r[0], r[1]) if r else (None, 0.0)
+
+
+RESET_AFTER = 3   # repairs on one file before abandoning it for the known-good base
+
+
+def error_signature(err: str) -> str:
+    """Collapse an error to what makes it the SAME failure, for cycle detection.
+
+    Numbers, quoted values and bracketed lists change between attempts while the failure
+    does not -- 9 duplicate columns then 13 duplicate columns is one problem, not two.
+    """
+    first = (err or "").strip().splitlines()[0] if (err or "").strip() else ""
+    first = re.sub(r"\[.*?\]", "[]", first)
+    first = re.sub(r"'[^']*'", "'x'", first)
+    first = re.sub(r"\d+", "N", first)
+    return first[:120]
 
 
 def inherit_base():
@@ -173,7 +190,7 @@ def iteration(n: int, args) -> dict:
 
     # ---- 3. preflight on a tiny subsample, repairing until it runs ---------------
     # A broken plugin should cost ~15s to discover, not a full 691k-row training run.
-    ok, result, attempts, seen_errors = False, {}, 0, []
+    ok, result, attempts, seen_errors, sigs = False, {}, 0, [], []
     for attempt in range(args.repairs + 1):
         attempts = attempt
         label = "preflight" if attempt == 0 else f"preflight after repair {attempt}"
@@ -189,8 +206,25 @@ def iteration(n: int, args) -> dict:
               flush=True)
         if attempt == args.repairs:
             break
-        print(f"[repairer] attempt {attempt+1}/{args.repairs}...", flush=True)
-        code = coder.repair(code, err, spec, previous_errors=seen_errors)
+
+        # Escape a rabbit hole instead of digging. Repairing edits whatever is in front of
+        # it, so a structurally wrong plugin gets patched and each patch inherits the flaw.
+        # Two signs it is not converging: the same error twice, or several attempts spent.
+        # Either way, throw the file away and re-implement the strategy minimally on the
+        # plugin that already scores.
+        sig = error_signature(err)
+        stuck = sigs.count(sig) >= 1 or attempt + 1 >= RESET_AFTER
+        sigs.append(sig)
+        if stuck and base:
+            print(f"[repairer] not converging ({sig[:60]}) -- restarting from "
+                  f"{base['exp_id']} with a minimal version", flush=True)
+            code = coder.restart_from_base(spec, base, seen_errors + [err])
+            sigs = []                      # a fresh line of attack gets a fresh budget
+        else:
+            print(f"[repairer] attempt {attempt+1}/{args.repairs}"
+                  f" (temp {min(0.6, 0.15 * attempt):.2f})...", flush=True)
+            code = coder.repair(code, err, spec, previous_errors=seen_errors,
+                                attempt=attempt)
         seen_errors.append(err)
 
     # ---- 3b. the real run on the frozen split -----------------------------------
