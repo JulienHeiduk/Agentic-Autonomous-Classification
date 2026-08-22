@@ -23,6 +23,31 @@ def history():
         ).fetchall()
 
 
+# Per-field caps for a full-detail entry. Capping how MANY iterations are replayed is not
+# enough on its own: the model writes 800-char hypotheses and 1,400-char feature lists, so
+# five entries swung between 10k and 15k chars purely on how verbose it felt that round.
+# Capping both count and size makes the block bounded rather than merely smaller.
+CLIP_HYPOTHESIS = 450
+CLIP_FEATURES = 600
+CLIP_HYPERPARAMS = 170
+CLIP_VERDICT = 450
+
+
+def _clip(text, limit: int) -> str:
+    """Shorten to `limit`, keeping the head AND the tail.
+
+    Tail-truncation would be actively harmful for verdicts: the critic is asked for "what
+    should the NEXT iteration try differently", so its recommendation is the last sentence.
+    Cutting the end keeps the complaint and discards the instruction.
+    """
+    t = str(text or "").strip()
+    if len(t) <= limit:
+        return t
+    head = limit * 2 // 3
+    tail = limit - head - 5
+    return f"{t[:head].rstrip()} [...] {t[-tail:].lstrip()}"
+
+
 FULL_DETAIL = 4   # most recent iterations replayed in full; older ones are one-liners
 
 
@@ -73,16 +98,16 @@ def build_context() -> str:
 
         out.append(f"--- iteration {i}: {eid} ---"
                    + ("   <-- BEST SO FAR" if i == best_i else ""))
-        out.append(f"  strategy   : {scrub(hyp)}")
+        out.append(f"  strategy   : {_clip(scrub(hyp), CLIP_HYPOTHESIS)}")
         if spec:
             try:
                 sp = json.loads(spec)
                 if sp.get("feature_engineering"):
-                    out.append("  features   : "
-                               + scrub('; '.join(sp['feature_engineering'][:8])))
+                    out.append("  features   : " + _clip(
+                        scrub('; '.join(sp['feature_engineering'][:8])), CLIP_FEATURES))
                 if sp.get("model_family"):
-                    out.append(f"  model      : {sp['model_family']} / "
-                               + scrub(str(sp.get('key_hyperparameters', ''))))
+                    out.append(f"  model      : {sp['model_family']} / " + _clip(
+                        scrub(str(sp.get('key_hyperparameters', ''))), CLIP_HYPERPARAMS))
             except Exception:
                 pass
         out.append(f"  status     : {status}")
@@ -104,9 +129,9 @@ def build_context() -> str:
             if status == "screening":
                 out.append(f"  VERDICT    : [written against a subsample score -- ignore any "
                            f"judgement it makes about whether the strategy works] "
-                           f"{scrub(verdict)}")
+                           f"{_clip(scrub(verdict), CLIP_VERDICT)}")
             else:
-                out.append(f"  VERDICT    : {scrub(verdict)}")
+                out.append(f"  VERDICT    : {_clip(scrub(verdict), CLIP_VERDICT)}")
         out.append("")
 
     if summarised:
