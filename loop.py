@@ -32,8 +32,8 @@ from harness.data import load
 PREFLIGHT_ROWS = 8000
 # 8,000 rows is seconds of work for any sane configuration, so a long ceiling here buys
 # nothing and costs a great deal: a plugin that picks 6000 CatBoost iterations at depth 10
-# blows any budget, and each repair attempt pays it again. At --repairs 3 a 600s ceiling
-# spent 40 minutes to learn the same thing 120s learns.
+# blows any budget, and each repair attempt pays it again: three attempts against a 600s
+# ceiling spent 30 minutes to learn what 120s learns, and --repairs now defaults to 10.
 PREFLIGHT_TIMEOUT = 120
 
 
@@ -260,7 +260,7 @@ def iteration(n: int, args) -> dict:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--iterations", type=int, default=2)
-    p.add_argument("--repairs", type=int, default=3)
+    p.add_argument("--repairs", type=int, default=10)
     p.add_argument("--timeout", type=int, default=2400)
     p.add_argument("--rows", type=int, default=None,
                    help="train on the first N rows only (fast screening; disables submit)")
