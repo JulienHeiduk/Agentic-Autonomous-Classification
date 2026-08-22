@@ -145,6 +145,39 @@ def _contract_problems(tree, defined):
     return problems
 
 
+
+def _timeout_error(timeout: int, rows) -> str:
+    """A timeout the repairer can act on.
+
+    `focused_error` cannot help here: nothing raised, so there is no traceback and no
+    failing line to point at. A bare "TIMEOUT after 600s" gives a repairer nothing to
+    change, so it returns a near-identical file and times out again -- three attempts,
+    three full waits, no progress. Naming the cause and the specific knobs is the
+    difference between a repair that converges and one that just costs time.
+    """
+    where = f"{rows:,} rows" if rows else "the full dataset"
+    msg = [f"TIMEOUT: the plugin did not finish within {timeout}s on {where}.",
+           "",
+           "Nothing crashed -- the code is too EXPENSIVE, not wrong. Do not restructure it."]
+    if rows:
+        msg += [
+            f"{rows:,} rows is a smoke test; a sane configuration finishes in seconds.",
+            "The cost is almost always the estimator, not the feature engineering.",
+            "",
+            "Fix it by shrinking the model in make_model(), keeping the strategy intact:",
+            "  * cut n_estimators / iterations hard (e.g. 6000 -> 600, 2000 -> 400)",
+            "  * cut depth / max_depth (e.g. 10 -> 6)",
+            "  * if you built an ensemble of several models, keep ONE of them",
+            "  * make sure the estimator uses every core: n_jobs=-1, or "
+            "thread_count=-1 for CatBoost -- a single-threaded fit is needlessly slow",
+            "",
+            "Change ONLY those numbers. Do not add features, do not change the algorithm.",
+        ]
+    else:
+        msg += ["Reduce n_estimators/iterations and depth so the fit completes in time."]
+    return "\n".join(msg)
+
+
 def write_plugin(exp_id: str, code: str):
     path = PLUGINS / f"{exp_id}.py"
     path.write_text(code)
@@ -172,7 +205,7 @@ def execute(exp_id: str, code: str, timeout: int = 2400, rows: int = None,
                  "PYTHONUNBUFFERED": "1", "HOME": str(C.ROOT)},
         )
     except subprocess.TimeoutExpired:
-        return False, {"ok": False, "error": f"TIMEOUT after {timeout}s"}, ""
+        return False, {"ok": False, "error": _timeout_error(timeout, rows)}, ""
 
     out, err = p.stdout, p.stderr
     for line in out.splitlines():

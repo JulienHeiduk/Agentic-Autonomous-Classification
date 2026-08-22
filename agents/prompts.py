@@ -66,6 +66,11 @@ RULES -- violating any of these fails the run:
     `freq_<key>` (train-fitted frequency) for notifications_per_day and app_opens_per_day.
     Keep them in X -- they are there by default if you only drop `id` and `addicted_label`.
     Never rebuild them.
+  * te_<key> and freq_<key> are FLOAT columns, not categories. NEVER name them in
+    cat_features / categorical_feature -- LightGBM fails with "Could not find
+    categorical_feature te_notifications_per_day in data file". The only categorical
+    columns are gender, stress_level and academic_work_impact, and the recipe below turns
+    those into integer codes, so you do not need cat_features at all.
   * NEVER FIT A MAPPING INSIDE make_features. It is called ONCE for train and ONCE for test,
     so anything fitted from the frame it is given -- `value_counts()`, a fitted encoder, a
     per-frame mean or normalisation -- produces a DIFFERENT mapping for each frame. The run
@@ -85,6 +90,17 @@ RULES -- violating any of these fails the run:
     math, itertools, collections, warnings, functools, re.
     No os, sys, pathlib, open(), file I/O, or network.
   * Return the model UNFITTED. make_model is called once per fold.
+  * USE EVERY CORE. This machine has 15. Say so explicitly in the constructor:
+        LightGBM / XGBoost / sklearn   ->  n_jobs=-1
+        CatBoost                       ->  thread_count=-1
+    A library default, or a hardcoded number like n_jobs=8, leaves most of the machine
+    idle and makes every fold slower for no benefit. No LLM is resident while your plugin
+    runs, so the whole machine is yours.
+  * KEEP THE MODEL CHEAP ENOUGH TO SMOKE-TEST. Before the real run, the harness fits your
+    plugin on 8,000 rows with a 120s budget. A sane configuration finishes that in seconds.
+    n_estimators/iterations in the low thousands with depth 10, or an ensemble of several
+    such models, blows it -- and a timeout gives the repairer no traceback to work from.
+    Prefer n_estimators <= 1500 and depth <= 8 unless the strategy explicitly needs more.
 
 NaN RULES -- EVERY COLUMN HAS 4%-19% MISSING VALUES. These are the errors that actually
 happen; read them before writing a line:
@@ -95,6 +111,29 @@ happen; read them before writing a line:
   * Comparisons and string ops on a column with NaN raise TypeError. Guard with .fillna().
   * LightGBM, XGBoost and CatBoost all handle NaN natively. Leaving NaN in a numeric
     column is the SAFE default -- you do not need to impute anything.
+
+COLUMN ALIGNMENT -- the single most common way a plugin fails. `make_features` is called
+once per frame, so any feature built for one frame and not the other, or built in a
+different order, ends the run with
+    ValueError: make_features: train and test columns differ
+
+Use exactly this shape. One function builds both frames, and the last line forces test to
+train's columns and order:
+
+    def _fe(df):
+        X = df.drop(columns=["id", "addicted_label"], errors="ignore").copy()
+        ...                                   # EVERY feature is added in here
+        return X
+
+    def make_features(train, test):
+        X_train = _fe(train)
+        X_test = _fe(test)[X_train.columns]   # <-- this line is what keeps them aligned
+        return X_train, X_test
+
+  * Put every feature inside _fe(). Never add one to X_train or X_test afterwards.
+  * Never make a column conditional on the frame -- no `if c in df.columns`, no `if
+    "addicted_label" in df`. A conditional column exists in one frame and not the other.
+  * Do not reorder or select columns after that last line.
 
 CATEGORICAL COLUMNS -- USE EXACTLY THIS, ALWAYS. Do not use pandas `category` dtype and do
 not use LabelEncoder. Integer codes work identically for every engine, handle NaN, and
@@ -148,6 +187,15 @@ IN -- all of these work:
     the harness calls .fit on whatever make_model returns. If you propose an ensemble,
     name VotingClassifier explicitly so the coder builds it correctly.
   * Preprocessing, as long as the whole thing is returned as a single sklearn Pipeline.
+
+PARALLELISM -- the machine has 15 cores and nothing else runs while a plugin trains. Any
+estimator you name should use all of them (n_jobs=-1, or thread_count=-1 for CatBoost).
+Do not put a hardcoded thread count like thread_count=8 in `key_hyperparameters`.
+
+BUDGET -- every plugin is smoke-tested on 8,000 rows with a 120s budget before the real run.
+Keep `key_hyperparameters` within that: n_estimators/iterations in the hundreds to ~1500 and
+depth <= 8 is ample here. Proposing 6000 iterations at depth 10 does not buy accuracy on this
+dataset; it spends the iteration on a timeout that produces no measurement at all.
 """
 
 
@@ -193,11 +241,16 @@ STRATEGY_SCHEMA = {
         "key_hyperparameters": {"type": "string"},
         "differs_from_previous": {"type": "string"},
         "expected_cv_auc": {"type": "number"},
+        # Which curated idea this implements. The enum is injected at call time from the
+        # queued backlog (see orchestrator.strategy_schema), so the model must PICK from
+        # the playbook rather than describe whatever the context already shows. Free-text
+        # novelty checks were tried first and paraphrases walked straight through them.
+        "playbook_ref": {"type": "string"},
     },
     "required": [
         "strategy_name", "hypothesis", "what_it_lets_the_model_ask",
         "feature_engineering", "model_family", "key_hyperparameters",
-        "differs_from_previous", "expected_cv_auc",
+        "differs_from_previous", "expected_cv_auc", "playbook_ref",
     ],
 }
 

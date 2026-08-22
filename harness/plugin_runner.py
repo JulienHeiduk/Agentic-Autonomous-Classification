@@ -72,10 +72,57 @@ def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None):
             if len(Xb) != len(test):
                 raise ValueError(f"make_features returned {len(Xb)} test rows, "
                                  f"expected {len(test)}")
+            for frame, which in ((Xa, "train"), (Xb, "test")):
+                cols = list(frame.columns)
+                dupes = sorted({c for c in cols if cols.count(c) > 1})
+                if dupes:
+                    # Checked BEFORE the order comparison, because duplicates present as a
+                    # mismatched order and the advice for that ("end with
+                    # X_test = _fe(test)[X_train.columns]") is useless here: indexing by a
+                    # list containing a repeated label returns that column once per
+                    # occurrence, so the reindex is what expands the frame. A plugin that
+                    # already had that line burned eight repair attempts being told to add
+                    # it.
+                    raise ValueError(
+                        f"make_features returned DUPLICATE column names in {which}: "
+                        f"{dupes[:8]}{' ...' if len(dupes) > 8 else ''} "
+                        f"({len(dupes)} distinct labels repeated).\n\n"
+                        f"Column names must be unique. `X_test = _fe(test)[X_train.columns]` "
+                        f"CANNOT fix this and is not the problem -- selecting by a list with "
+                        f"a repeated label returns the column once per occurrence, which "
+                        f"changes the shape.\n\n"
+                        f"The usual cause is PolynomialFeatures(degree=2), which re-emits "
+                        f"the degree-1 terms, so pd.concat([X, X_poly], axis=1) duplicates "
+                        f"every original column. Fix it where the block is built, e.g.\n"
+                        f"    X_poly = X_poly.drop(columns=[c for c in X_poly.columns "
+                        f"if c in X.columns])\n"
+                        f"or rename the block: X_poly.columns = [f'poly_{{c}}' for c in "
+                        f"X_poly.columns]"
+                    )
             if list(Xa.columns) != list(Xb.columns):
-                raise ValueError("make_features: train and test columns differ")
+                # Naming the columns is the whole point. The bare message cost three
+                # iterations and thirteen repair attempts in a row, because a repairer told
+                # only "columns differ" has nothing to change and returns the same file.
+                a, b = list(Xa.columns), list(Xb.columns)
+                only_a = [c for c in a if c not in set(b)]
+                only_b = [c for c in b if c not in set(a)]
+                bits = []
+                if only_a:
+                    bits.append(f"in TRAIN but not test: {only_a[:8]}")
+                if only_b:
+                    bits.append(f"in TEST but not train: {only_b[:8]}")
+                if not only_a and not only_b:
+                    bits.append("same columns, DIFFERENT ORDER")
+                raise ValueError(
+                    "make_features: train and test columns differ -- "
+                    + "; ".join(bits)
+                    + ". Build both frames with the SAME function and end with "
+                      "`X_test = _fe(test)[X_train.columns]`. Do not make any column "
+                      "conditional on which frame it is."
+                )
             if C.TARGET in Xa.columns:
                 raise ValueError(f"make_features leaked '{C.TARGET}' into the feature frame")
+            _check_numeric(Xa, Xb)
         return Xa, Xb
 
     # NOTE: a partition_seed run deliberately does NOT use the frozen split, so its OOF is
@@ -120,6 +167,41 @@ def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None):
         feature_seconds=round(feat_s, 1), runtime_s=round(time.time() - t0, 1),
     )
 
+
+
+
+def _check_numeric(Xa, Xb):
+    """Reject non-numeric feature columns, BY NAME, before an engine sees them.
+
+    Left to CatBoost this surfaces as
+
+        Bad value for num_feature[non_default_doc_idx=0,feature_idx=32]="4_7":
+        Cannot convert '4_7' to float
+
+    which the repairer cannot act on: every traceback frame is inside _catboost.pyx, so
+    focused_error has no line of the plugin to point at, and `feature_idx=32` is a position
+    the model would have to count its own columns at runtime to resolve. Three attempts in a
+    row changed nothing. The harness is holding the dataframe and can just say which column
+    it is and what is in it.
+    """
+    bad = []
+    for frame, which in ((Xa, "train"), (Xb, "test")):
+        for c in frame.columns:
+            if pd.api.types.is_numeric_dtype(frame[c]) or pd.api.types.is_bool_dtype(frame[c]):
+                continue
+            sample = frame[c].dropna()
+            example = repr(sample.iloc[0]) if len(sample) else "all-NaN"
+            bad.append(f"'{c}' in {which} is dtype {frame[c].dtype} (e.g. {example})")
+    if bad:
+        raise ValueError(
+            "make_features returned non-numeric columns, which no engine can fit:\n  "
+            + "\n  ".join(bad[:8])
+            + "\n\nEvery column in X must be numeric. If you built a cross or interaction "
+              "feature by pasting values together as text (e.g. a.astype(str) + '_' + "
+              "b.astype(str)), that is the cause -- build it numerically instead, for "
+              "example a * 100 + b on integer codes, or drop it. For the three categorical "
+              "columns use the pd.Categorical(...).codes recipe from the contract."
+        )
 
 
 def _check_consistency(Xtr, Xte):

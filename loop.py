@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import time
 import traceback
 
@@ -30,6 +31,11 @@ from harness.data import load
 
 
 PREFLIGHT_ROWS = 8000
+# 8,000 rows is seconds of work for any sane configuration, so a long ceiling here buys
+# nothing and costs a great deal: a plugin that picks 6000 CatBoost iterations at depth 10
+# blows any budget, and each repair attempt pays it again: three attempts against a 600s
+# ceiling spent 30 minutes to learn what 120s learns, and --repairs now defaults to 10.
+PREFLIGHT_TIMEOUT = 120
 
 
 def _rule(txt=""):
@@ -48,6 +54,57 @@ def best_loop_run():
             "AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1"
         ).fetchone()
     return (r[0], r[1]) if r else (None, 0.0)
+
+
+RESET_AFTER = 3   # repairs on one file before abandoning it for the known-good base
+
+
+def error_signature(err: str) -> str:
+    """Collapse an error to what makes it the SAME failure, for cycle detection.
+
+    Numbers, quoted values and bracketed lists change between attempts while the failure
+    does not -- 9 duplicate columns then 13 duplicate columns is one problem, not two.
+    """
+    first = (err or "").strip().splitlines()[0] if (err or "").strip() else ""
+    first = re.sub(r"\[.*?\]", "[]", first)
+    first = re.sub(r"'[^']*'", "'x'", first)
+    first = re.sub(r"\d+", "N", first)
+    return first[:120]
+
+
+def inherit_base():
+    """The best plugin the loop has produced, as source for the next iteration to mutate.
+
+    This is the code-level half of the recursion. build_context() already carries strategy
+    and results forward; without this the coder rebuilt every implementation from a prose
+    bullet list and a static example, so a 0.965 file was re-derived from memory each time
+    and consecutive plugins were only 41-71% alike. Improvements were being re-invented
+    rather than kept.
+
+    Only promoted/baseline runs qualify. A rejected member is rejected because its number
+    could not be trusted -- loop06 was rejected for a train/test leak -- and inheriting its
+    code would carry that forward. Screening runs are excluded because their CV is a
+    subsample number, not a measurement.
+
+    The candidate is re-checked against the CURRENT static rules before being offered: the
+    contract has tightened since older plugins were written, and handing the coder a base
+    that no longer passes would fail the iteration before it starts.
+    """
+    with ledger.conn() as c:
+        rows = c.execute(
+            "SELECT exp_id, cv_auc, actual_lb FROM experiments WHERE family='loop' "
+            "AND cv_auc IS NOT NULL AND status IN ('promoted', 'baseline') "
+            "ORDER BY cv_auc DESC"
+        ).fetchall()
+    for exp_id, cv, lb in rows:
+        path = sandbox.PLUGINS / f"{exp_id}.py"
+        if not path.exists():
+            continue
+        code = path.read_text()
+        if sandbox.static_check(code):
+            continue
+        return {"exp_id": exp_id, "cv": cv, "lb": lb, "code": code}
+    return None
 
 
 def best_cv():
@@ -117,22 +174,29 @@ def iteration(n: int, args) -> dict:
         exp_id, family="loop", tier="full", status="running",
         hypothesis=spec["hypothesis"],
         what_it_lets_the_model_ask=spec["what_it_lets_the_model_ask"],
-        playbook_ref=spec["strategy_name"], spec=spec,
+        playbook_ref=spec.get("playbook_ref") or "other", spec=spec,
     )
 
     # ---- 2. write the code ------------------------------------------------------
-    print("\n[coder] writing plugin...", flush=True)
-    code = coder.write_plugin(spec)
+    base = None if getattr(args, "no_inherit", False) else inherit_base()
+    if base:
+        lb_txt = f", LB {base['lb']:.5f}" if base.get("lb") else ""
+        print(f"\n[coder] writing plugin (mutating {base['exp_id']}, "
+              f"CV {base['cv']:.6f}{lb_txt})...", flush=True)
+    else:
+        print("\n[coder] writing plugin (from the reference example)...", flush=True)
+    code = coder.write_plugin(spec, base=base)
     print(f"    {len(code.splitlines())} lines", flush=True)
 
     # ---- 3. preflight on a tiny subsample, repairing until it runs ---------------
     # A broken plugin should cost ~15s to discover, not a full 691k-row training run.
-    ok, result, attempts, seen_errors = False, {}, 0, []
+    ok, result, attempts, seen_errors, sigs = False, {}, 0, [], []
     for attempt in range(args.repairs + 1):
         attempts = attempt
         label = "preflight" if attempt == 0 else f"preflight after repair {attempt}"
         print(f"\n[sandbox] {label} ({PREFLIGHT_ROWS:,} rows)...", flush=True)
-        ok, result, _ = sandbox.execute(exp_id, code, timeout=600, rows=PREFLIGHT_ROWS)
+        ok, result, _ = sandbox.execute(exp_id, code, timeout=PREFLIGHT_TIMEOUT,
+                                        rows=PREFLIGHT_ROWS)
         if ok:
             print(f"    preflight OK (auc {result['cv_auc']:.4f}, "
                   f"{result['n_features']} features)", flush=True)
@@ -142,8 +206,25 @@ def iteration(n: int, args) -> dict:
               flush=True)
         if attempt == args.repairs:
             break
-        print(f"[repairer] attempt {attempt+1}/{args.repairs}...", flush=True)
-        code = coder.repair(code, err, spec, previous_errors=seen_errors)
+
+        # Escape a rabbit hole instead of digging. Repairing edits whatever is in front of
+        # it, so a structurally wrong plugin gets patched and each patch inherits the flaw.
+        # Two signs it is not converging: the same error twice, or several attempts spent.
+        # Either way, throw the file away and re-implement the strategy minimally on the
+        # plugin that already scores.
+        sig = error_signature(err)
+        stuck = sigs.count(sig) >= 1 or attempt + 1 >= RESET_AFTER
+        sigs.append(sig)
+        if stuck and base:
+            print(f"[repairer] not converging ({sig[:60]}) -- restarting from "
+                  f"{base['exp_id']} with a minimal version", flush=True)
+            code = coder.restart_from_base(spec, base, seen_errors + [err])
+            sigs = []                      # a fresh line of attack gets a fresh budget
+        else:
+            print(f"[repairer] attempt {attempt+1}/{args.repairs}"
+                  f" (temp {min(0.6, 0.15 * attempt):.2f})...", flush=True)
+            code = coder.repair(code, err, spec, previous_errors=seen_errors,
+                                attempt=attempt)
         seen_errors.append(err)
 
     # ---- 3b. the real run on the frozen split -----------------------------------
@@ -213,10 +294,13 @@ def iteration(n: int, args) -> dict:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--iterations", type=int, default=2)
-    p.add_argument("--repairs", type=int, default=3)
+    p.add_argument("--repairs", type=int, default=10)
     p.add_argument("--timeout", type=int, default=2400)
     p.add_argument("--rows", type=int, default=None,
                    help="train on the first N rows only (fast screening; disables submit)")
+    p.add_argument("--no-inherit", action="store_true",
+                   help="write each plugin from the reference example instead of "
+                        "mutating the best one so far (wider exploration)")
     p.add_argument("--no-submit", dest="submit", action="store_false")
     p.set_defaults(submit=True)
     args = p.parse_args()
