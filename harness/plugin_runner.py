@@ -73,7 +73,26 @@ def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None):
                 raise ValueError(f"make_features returned {len(Xb)} test rows, "
                                  f"expected {len(test)}")
             if list(Xa.columns) != list(Xb.columns):
-                raise ValueError("make_features: train and test columns differ")
+                # Naming the columns is the whole point. The bare message cost three
+                # iterations and thirteen repair attempts in a row, because a repairer told
+                # only "columns differ" has nothing to change and returns the same file.
+                a, b = list(Xa.columns), list(Xb.columns)
+                only_a = [c for c in a if c not in set(b)]
+                only_b = [c for c in b if c not in set(a)]
+                bits = []
+                if only_a:
+                    bits.append(f"in TRAIN but not test: {only_a[:8]}")
+                if only_b:
+                    bits.append(f"in TEST but not train: {only_b[:8]}")
+                if not only_a and not only_b:
+                    bits.append("same columns, DIFFERENT ORDER")
+                raise ValueError(
+                    "make_features: train and test columns differ -- "
+                    + "; ".join(bits)
+                    + ". Build both frames with the SAME function and end with "
+                      "`X_test = _fe(test)[X_train.columns]`. Do not make any column "
+                      "conditional on which frame it is."
+                )
             if C.TARGET in Xa.columns:
                 raise ValueError(f"make_features leaked '{C.TARGET}' into the feature frame")
         return Xa, Xb

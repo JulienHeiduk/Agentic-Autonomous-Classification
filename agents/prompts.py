@@ -66,6 +66,11 @@ RULES -- violating any of these fails the run:
     `freq_<key>` (train-fitted frequency) for notifications_per_day and app_opens_per_day.
     Keep them in X -- they are there by default if you only drop `id` and `addicted_label`.
     Never rebuild them.
+  * te_<key> and freq_<key> are FLOAT columns, not categories. NEVER name them in
+    cat_features / categorical_feature -- LightGBM fails with "Could not find
+    categorical_feature te_notifications_per_day in data file". The only categorical
+    columns are gender, stress_level and academic_work_impact, and the recipe below turns
+    those into integer codes, so you do not need cat_features at all.
   * NEVER FIT A MAPPING INSIDE make_features. It is called ONCE for train and ONCE for test,
     so anything fitted from the frame it is given -- `value_counts()`, a fitted encoder, a
     per-frame mean or normalisation -- produces a DIFFERENT mapping for each frame. The run
@@ -106,6 +111,29 @@ happen; read them before writing a line:
   * Comparisons and string ops on a column with NaN raise TypeError. Guard with .fillna().
   * LightGBM, XGBoost and CatBoost all handle NaN natively. Leaving NaN in a numeric
     column is the SAFE default -- you do not need to impute anything.
+
+COLUMN ALIGNMENT -- the single most common way a plugin fails. `make_features` is called
+once per frame, so any feature built for one frame and not the other, or built in a
+different order, ends the run with
+    ValueError: make_features: train and test columns differ
+
+Use exactly this shape. One function builds both frames, and the last line forces test to
+train's columns and order:
+
+    def _fe(df):
+        X = df.drop(columns=["id", "addicted_label"], errors="ignore").copy()
+        ...                                   # EVERY feature is added in here
+        return X
+
+    def make_features(train, test):
+        X_train = _fe(train)
+        X_test = _fe(test)[X_train.columns]   # <-- this line is what keeps them aligned
+        return X_train, X_test
+
+  * Put every feature inside _fe(). Never add one to X_train or X_test afterwards.
+  * Never make a column conditional on the frame -- no `if c in df.columns`, no `if
+    "addicted_label" in df`. A conditional column exists in one frame and not the other.
+  * Do not reorder or select columns after that last line.
 
 CATEGORICAL COLUMNS -- USE EXACTLY THIS, ALWAYS. Do not use pandas `category` dtype and do
 not use LabelEncoder. Integer codes work identically for every engine, handle NaN, and
