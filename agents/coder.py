@@ -4,15 +4,39 @@ import json
 from agents import ollama, prompts
 
 
-def write_plugin(spec: dict, model: str = None) -> str:
+def write_plugin(spec: dict, model: str = None, base: dict = None) -> str:
+    """Turn a strategy into a plugin, mutating the best plugin so far when there is one.
+
+    `base` is what makes the recursion reach the code. Given one, the model edits a file
+    that is known to run and known to score, instead of rebuilding the same feature
+    engineering from a bullet list every iteration and losing pieces of it in the process.
+    Without one -- first iteration, or --no-inherit -- it falls back to the static example.
+    """
     strategy = json.dumps(spec, indent=2)
+    if base:
+        lb = f" and LB {base['lb']:.5f}" if base.get("lb") else ""
+        anchor = (
+            f"YOU ARE MODIFYING AN EXISTING FILE, NOT WRITING ONE FROM SCRATCH.\n\n"
+            f"Below is `{base['exp_id']}`, the best plugin this loop has produced -- "
+            f"CV {base['cv']:.6f}{lb}. It runs, and it already satisfies every rule above.\n\n"
+            f"Apply the STRATEGY to this file using the SMALLEST set of changes that "
+            f"implements it. Keep everything the strategy does not ask you to change: the "
+            f"feature engineering already here is what earns the current score, and "
+            f"rewriting it from memory is how a good score gets lost. Return the COMPLETE "
+            f"modified file.\n\n"
+            f"```python\n{base['code']}\n```\n"
+        )
+    else:
+        anchor = (
+            f"Here is a COMPLETE, CORRECT example of the file format. Follow its structure "
+            f"exactly; change the feature engineering and the model to match the strategy "
+            f"above:\n\n{prompts.EXAMPLE_PLUGIN}\n"
+        )
     user = (
         f"{prompts.TASK}\n\n"
         f"STRATEGY TO IMPLEMENT:\n{strategy}\n\n"
         f"{prompts.CONTRACT}\n\n"
-        f"Here is a COMPLETE, CORRECT example of the file format. Follow its structure "
-        f"exactly; change the feature engineering and the model to match the strategy "
-        f"above:\n\n{prompts.EXAMPLE_PLUGIN}\n"
+        f"{anchor}"
     )
     txt = ollama.chat(
         model or ollama.CODER, prompts.CODER_SYSTEM, user,

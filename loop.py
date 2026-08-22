@@ -55,6 +55,41 @@ def best_loop_run():
     return (r[0], r[1]) if r else (None, 0.0)
 
 
+def inherit_base():
+    """The best plugin the loop has produced, as source for the next iteration to mutate.
+
+    This is the code-level half of the recursion. build_context() already carries strategy
+    and results forward; without this the coder rebuilt every implementation from a prose
+    bullet list and a static example, so a 0.965 file was re-derived from memory each time
+    and consecutive plugins were only 41-71% alike. Improvements were being re-invented
+    rather than kept.
+
+    Only promoted/baseline runs qualify. A rejected member is rejected because its number
+    could not be trusted -- loop06 was rejected for a train/test leak -- and inheriting its
+    code would carry that forward. Screening runs are excluded because their CV is a
+    subsample number, not a measurement.
+
+    The candidate is re-checked against the CURRENT static rules before being offered: the
+    contract has tightened since older plugins were written, and handing the coder a base
+    that no longer passes would fail the iteration before it starts.
+    """
+    with ledger.conn() as c:
+        rows = c.execute(
+            "SELECT exp_id, cv_auc, actual_lb FROM experiments WHERE family='loop' "
+            "AND cv_auc IS NOT NULL AND status IN ('promoted', 'baseline') "
+            "ORDER BY cv_auc DESC"
+        ).fetchall()
+    for exp_id, cv, lb in rows:
+        path = sandbox.PLUGINS / f"{exp_id}.py"
+        if not path.exists():
+            continue
+        code = path.read_text()
+        if sandbox.static_check(code):
+            continue
+        return {"exp_id": exp_id, "cv": cv, "lb": lb, "code": code}
+    return None
+
+
 def best_cv():
     return best_loop_run()[1]
 
@@ -126,8 +161,14 @@ def iteration(n: int, args) -> dict:
     )
 
     # ---- 2. write the code ------------------------------------------------------
-    print("\n[coder] writing plugin...", flush=True)
-    code = coder.write_plugin(spec)
+    base = None if getattr(args, "no_inherit", False) else inherit_base()
+    if base:
+        lb_txt = f", LB {base['lb']:.5f}" if base.get("lb") else ""
+        print(f"\n[coder] writing plugin (mutating {base['exp_id']}, "
+              f"CV {base['cv']:.6f}{lb_txt})...", flush=True)
+    else:
+        print("\n[coder] writing plugin (from the reference example)...", flush=True)
+    code = coder.write_plugin(spec, base=base)
     print(f"    {len(code.splitlines())} lines", flush=True)
 
     # ---- 3. preflight on a tiny subsample, repairing until it runs ---------------
@@ -223,6 +264,9 @@ def main():
     p.add_argument("--timeout", type=int, default=2400)
     p.add_argument("--rows", type=int, default=None,
                    help="train on the first N rows only (fast screening; disables submit)")
+    p.add_argument("--no-inherit", action="store_true",
+                   help="write each plugin from the reference example instead of "
+                        "mutating the best one so far (wider exploration)")
     p.add_argument("--no-submit", dest="submit", action="store_false")
     p.set_defaults(submit=True)
     args = p.parse_args()
