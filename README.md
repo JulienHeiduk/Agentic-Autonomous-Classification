@@ -14,19 +14,40 @@ Design notes and the competitive intelligence behind the prompts: [`SPEC.md`](SP
 
 ```bash
 export PYTHONPATH=.
-.venv/bin/python loop.py --iterations 2                 # plan → code → run → judge → submit → feed forward
-.venv/bin/python loop.py --iterations 2 --no-submit     # no Kaggle calls
-.venv/bin/python loop.py --iterations 4 --rows 120000   # fast screening on a subsample
 
-.venv/bin/python -m harness.confirm                     # measure the noise floor (do this once)
-.venv/bin/python -m harness.submit --quota              # submissions left today
-.venv/bin/python -m harness.report                      # rewrite ROADMAP.md / BACKLOG.md
+# --- explore: one orchestrator per model family -------------------------------
+.venv/bin/python loop.py --iterations 5                          # gbm (the default)
+.venv/bin/python loop.py --iterations 5 --family linear
+.venv/bin/python loop.py --iterations 5 --family nn
+.venv/bin/python loop.py --iterations 5 --no-submit              # no Kaggle calls
+.venv/bin/python loop.py --iterations 4 --rows 120000            # fast screening
+
+# --- combine: stack the stored OOF into a new member --------------------------
+# loop.py runs this automatically at the end of a run; --no-blend skips it,
+# and you can run it standalone at any time:
+.venv/bin/python -m harness.blend
+
+# --- submit and report --------------------------------------------------------
+.venv/bin/python -m harness.submit --quota                       # submissions left today
+.venv/bin/python -m harness.submit <exp_id>                      # submit one member
+.venv/bin/python -m harness.submit --reconcile                   # pull scores into the ledger
+.venv/bin/python -m harness.report                               # rewrite ROADMAP / BACKLOG
+.venv/bin/python -m harness.confirm                              # measure the noise floor (once)
 ```
 
-Iteration numbering continues from the ledger, so a second invocation produces iteration 3, not
-another iteration 1. `touch state/PAUSE` stops a long run cleanly after the current iteration.
+`loop.py` flags: `--iterations`, `--family {gbm,linear,nn}`, `--repairs` (default 10),
+`--timeout` (full-run seconds, default 2400), `--rows N` (screening; disables submit),
+`--no-inherit` (do not mutate the family's best plugin), `--no-blend` (skip the stacking
+pass at the end), `--no-submit`.
 
-Requires Ollama running locally. Models used (both already installed):
+Each family inherits only its own promoted plugins, so a family with none yet starts from
+the reference example rather than being handed another family's model.
+
+Iteration numbering continues from the ledger, so a second invocation produces iteration 3,
+not another iteration 1. `touch state/PAUSE` stops a long run cleanly after the current
+iteration.
+
+Requires Ollama running locally. Models used:
 
 | Role | Model | Measured |
 |---|---|---|
@@ -39,6 +60,46 @@ training subprocess.
 Swapping either model means checking its `think` setting first: the correct value differs per
 model, and the wrong one returns HTTP 200 with empty content rather than an error. The measured
 matrix and the per-model map are in `agents/ollama.py`.
+
+## Model families
+
+Each family is a separate orchestrator with its own estimator set **and its own contract**,
+because they do not agree on the basics: a GBM is handed NaN and integer codes and does the
+right thing, while a linear model or an MLP crashes on the first and cannot use the second.
+
+| `--family` | estimators | key contract difference |
+|---|---|---|
+| `gbm` | LightGBM, XGBoost, CatBoost, HistGradientBoosting | leave NaN in, integer codes, no scaling |
+| `linear` | LogisticRegression, SGD, Ridge, ElasticNet | impute + scale + one-hot, all inside the Pipeline |
+| `nn` | `MLPClassifier` in four configurations | as linear, plus `early_stopping=True` and no `n_jobs` |
+
+Only `sklearn` neural networks are available — there is no torch, tensorflow or keras in this
+environment, so TabNet and FT-Transformer cannot be built. Definitions live in
+[`agents/families.py`](agents/families.py).
+
+Fitted steps belong in the Pipeline returned by `make_model`, never in `make_features` — that
+function is called once per frame, so anything fitted there is fitted twice on different data.
+
+## Blending
+
+`harness/blend.py` turns the stored out-of-fold predictions into a new member. It needs no
+LLM: the technique is settled by measurement, and the remaining choices are a handful of
+discrete options that greedy search covers exactly.
+
+```
+quarantine   hash-dedupe, degenerate check, OOF-vs-test KS drift
+transform    clip(log(p/(1-p)), ±30); rank-gauss above 25 members
+stack        LogisticRegression, fitted OUT OF FOLD on the frozen split
+select       greedy forward, stopping when the gain drops below the noise floor
+```
+
+Every full-data run stores its OOF and test predictions aligned to the frozen split, so any
+member — hand-written or loop-generated — is eligible. The first run selected `xgb_te`,
+`lgb_te` and `loop04_67440` for 0.968710 against a best single member of 0.968587.
+
+The stacker's score is the **nested** one: for each fold it is fitted on the other folds' rows
+only. A stacker fitted on every OOF row and scored on those same rows is the leakage described
+below, relocated.
 
 ## A CV number is not a result
 

@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from harness import config as C
-from harness import encode, folds, ledger
+from harness import blend, encode, folds, ledger
 from harness.data import load
 from harness.evaluate import auc
 
@@ -41,9 +41,17 @@ def _fit_predict(model, Xa, ya, Xb, Xt):
     return model.decision_function(Xb), model.decision_function(Xt)
 
 
-def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None):
+def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None, stack=False):
     t0 = time.time()
-    train, test, y = load()
+    if stack:
+        # A second-level run. The plugin sees one column per member holding that member's
+        # predicted probability, so it trains on other models' output rather than on the
+        # raw columns. Target encoding is skipped -- there are no lookup keys here.
+        train, test, y, members = blend.member_frames()
+        print(f"  stacking over {len(members)} members: {', '.join(members[:6])}"
+              + (" ..." if len(members) > 6 else ""), flush=True)
+    else:
+        train, test, y = load()
     if n_rows:                       # screening / preflight mode
         train = train.iloc[:n_rows].reset_index(drop=True)
         test = test.iloc[:n_rows].reset_index(drop=True)
@@ -139,12 +147,15 @@ def run(plugin_path, exp_id, n_rows=None, seed=42, partition_seed=None):
     n_features = 0
     for k, (itr, iva) in enumerate(splits):
         t_feat = time.time()
-        te_tr, te_te = encode.fold_target_encode(
-            train, test, y, itr, iva, C.TE_COLUMNS,
-            smoothing=C.TE_SMOOTHING, seed=C.FOLD_SEED)
-        fq_tr, fq_te = encode.train_frequency(train, test, C.FREQ_COLUMNS)
-        Xtr, Xte = _features_for(train.assign(**te_tr, **fq_tr),
-                                 test.assign(**te_te, **fq_te), check=(k == 0))
+        if stack:
+            Xtr, Xte = _features_for(train, test, check=(k == 0))
+        else:
+            te_tr, te_te = encode.fold_target_encode(
+                train, test, y, itr, iva, C.TE_COLUMNS,
+                smoothing=C.TE_SMOOTHING, seed=C.FOLD_SEED)
+            fq_tr, fq_te = encode.train_frequency(train, test, C.FREQ_COLUMNS)
+            Xtr, Xte = _features_for(train.assign(**te_tr, **fq_tr),
+                                     test.assign(**te_te, **fq_te), check=(k == 0))
         if k == 0:
             _check_consistency(Xtr, Xte)
         feat_s += time.time() - t_feat
@@ -296,9 +307,11 @@ def main():
     p.add_argument("exp_id")
     p.add_argument("--rows", type=int, default=None)
     p.add_argument("--partition-seed", type=int, default=None)
+    p.add_argument("--stack", action="store_true")
     a = p.parse_args()
     try:
-        out = run(a.plugin, a.exp_id, a.rows, partition_seed=a.partition_seed)
+        out = run(a.plugin, a.exp_id, a.rows, partition_seed=a.partition_seed,
+                  stack=a.stack)
     except Exception:
         out = dict(ok=False, exp_id=a.exp_id, error=focused_error(a.plugin))
     print("###RESULT###" + json.dumps(out))

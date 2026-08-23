@@ -93,6 +93,87 @@ fold *j*" carries fold *k*'s labels into fold *k*'s training set.
 
 After the change, `propose()` returns an implementable strategy **8/8**, up from 2/8.
 
+## 0d. Families and blending (2026-08-23)
+
+**One orchestrator per model family.** `model_family` was a single schema enum listing four
+gradient-boosting engines, so "the orchestrator always picks a GBM" was not a preference —
+it was the entire space it could name. `agents/families.py` now defines `gbm`, `linear` and
+`nn`, each with its own estimator enum and its own contract, selected by `loop.py --family`.
+
+The contracts genuinely differ, and merging them produced broken plugins:
+
+| family | NaN | scaling | categoricals | threads |
+|---|---|---|---|---|
+| `gbm` | leave in place | none | integer codes | `n_jobs=-1` / `thread_count=-1` |
+| `linear` | fatal — impute | required | one-hot the low-cardinality three | none accepted |
+| `nn` | fatal — impute | required, more so | one-hot | `MLPClassifier` takes no `n_jobs` |
+
+Two rules had to be corrected when the families landed. The contract stated `n_jobs=-1`
+unconditionally, which raises `TypeError` on `MLPClassifier` and `RidgeClassifier`. And
+"scale everything" collided with "never fit a mapping inside `make_features`" — the coder put
+a `StandardScaler` in the feature builder, which is called once per frame, so it fitted twice
+and scored PSI 1.265 on one column. Every fitted step belongs in the Pipeline returned by
+`make_model`; `make_features` does arithmetic only.
+
+Only `sklearn` neural networks are reachable: there is no torch, tensorflow, keras, jax or
+skorch in the environment, so `nn` means `MLPClassifier` in four configurations. Preflight
+scores on 8,000 rows put `gbm` at ~0.948, `nn` at 0.943–0.945 and `linear` at 0.914–0.929 —
+all three well under the 0.966 solo cliff that §3.3's `arch_below_cliff` says a member must
+clear before it contributes anything to a blend.
+
+**Blending needs no LLM.** `harness/blend.py` reads the stored OOF arrays, which every
+full-data run has been writing since the beginning and nothing had ever read back. The
+technique was already decided by measurement — `logit_or_rankgauss_stack` is marked done —
+and the remaining choices are few enough for greedy search to cover exactly. A model
+proposing member subsets would add a failure path and no capability.
+
+The pipeline: quarantine (hash-dedupe, degenerate, OOF-vs-test KS drift), transform to
+`clip(log(p/(1-p)), ±30)`, fit a `LogisticRegression` stacker **out of fold on the frozen
+split**, and select members greedily until the gain falls below the measured noise floor.
+
+Measured on the first nine loop members, all GBM with pairwise OOF correlation 0.98–0.998:
+
+| | AUC |
+|---|---|
+| best single member | 0.965142 |
+| simple average | 0.965088 — *worse than the best single* |
+| nested logit stack | 0.965388 (+0.000246, 8.6× floor) |
+
+The average losing to the best member is the argument for a stacker rather than a mean:
+averaging correlated members of unequal strength dilutes the strongest, while a fitted linear
+stacker can down-weight and subtract. Including the hand-written tier0 members, the first
+recorded blend reached 0.968710 from `xgb_te`, `lgb_te` and `loop04_67440`.
+
+**What the blend score does not remove.** The stacker is nested, so it never scores a row its
+own fit saw. But the members' OOF values were produced on the same split, so a stacker
+training row carries predictions from models that trained on the held-out fold — a
+second-order optimism that only full nesting (retraining every base model per outer fold)
+would remove, at prohibitive cost. Greedy selection on OOF adds a second, smaller layer. The
+leaderboard remains the arbiter, per §0b.
+
+**The blend runs at the end of every loop run** (`--no-blend` to skip), because a blender
+nothing invokes is a blender that never runs: members accumulated and were never combined
+until someone remembered the command. It runs after the iterations rather than between them
+-- greedy selection is O(n^2) stacker fits, and a run's members are only worth re-stacking
+once they all exist. A failure there is caught and reported, never allowed to discard
+iterations that already succeeded.
+
+**Inheritance is per family.** `inherit_base(family)` filters candidates by `model_family`,
+so each family mutates its own best plugin. Handing a linear run the best CatBoost plugin
+gave the coder a tree to mutate while the strategy said use a linear model, and the mutation
+prompt asks it to preserve everything the strategy did not mention. A family with no promoted
+member yet gets the reference example.
+
+**The orchestrator is told the blend exists.** `build_context()` filters `family='loop'`, so
+the blend row was invisible and the loop kept optimising solo CV while its members were being
+stacked. The prompt now carries the current blend, its members, and the point that a member
+scoring slightly lower but making different mistakes can outweigh another near-copy -- with
+the 0.966 cliff stated, because different alone has historically been worth nothing.
+
+**Blending monetises diversity, it does not create it.** The 0.98–0.998 correlation across
+the GBM pool is why the gain is +0.00025 where §2 measured +0.0004. More GBM iterations will
+not fix that; members from another family clearing the 0.966 cliff would.
+
 ## 1. Measured facts (all verified on this machine today)
 
 ### 1.1 Data

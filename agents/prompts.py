@@ -90,9 +90,12 @@ RULES -- violating any of these fails the run:
     math, itertools, collections, warnings, functools, re.
     No os, sys, pathlib, open(), file I/O, or network.
   * Return the model UNFITTED. make_model is called once per fold.
-  * USE EVERY CORE. This machine has 15. Say so explicitly in the constructor:
-        LightGBM / XGBoost / sklearn   ->  n_jobs=-1
-        CatBoost                       ->  thread_count=-1
+  * USE EVERY CORE, WHERE THE ESTIMATOR SUPPORTS IT. This machine has 15:
+        LightGBM / XGBoost / RandomForest  ->  n_jobs=-1
+        CatBoost                           ->  thread_count=-1
+        MLPClassifier, RidgeClassifier, most LogisticRegression solvers
+                                           ->  NEITHER. They take no n_jobs argument and
+                                               passing one raises TypeError. Omit it.
     A library default, or a hardcoded number like n_jobs=8, leaves most of the machine
     idle and makes every fold slower for no benefit. No LLM is resident while your plugin
     runs, so the whole machine is yours.
