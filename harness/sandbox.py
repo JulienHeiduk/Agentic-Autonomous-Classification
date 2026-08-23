@@ -185,7 +185,7 @@ def write_plugin(exp_id: str, code: str):
 
 
 def execute(exp_id: str, code: str, timeout: int = 2400, rows: int = None,
-            partition_seed: int = None, plugin_path=None):
+            partition_seed: int = None, plugin_path=None, stack: bool = False):
     """Static-check, write, run. Returns (ok, result_dict, stderr_text)."""
     problems = static_check(code)
     if problems:
@@ -197,6 +197,8 @@ def execute(exp_id: str, code: str, timeout: int = 2400, rows: int = None,
         cmd += ["--rows", str(rows)]
     if partition_seed is not None:
         cmd += ["--partition-seed", str(partition_seed)]
+    if stack:
+        cmd += ["--stack"]
 
     try:
         p = subprocess.run(
