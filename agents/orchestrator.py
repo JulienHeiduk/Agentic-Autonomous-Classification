@@ -10,7 +10,7 @@ import json
 import re
 import unicodedata
 
-from agents import ollama, prompts
+from agents import families, ollama, prompts
 from harness import ledger
 
 
@@ -182,12 +182,18 @@ def scrub(text: str) -> str:
     return FORBIDDEN.sub("[removed: impossible here -- the feature step never sees y]", text)
 
 
-def forbidden_techniques(spec: dict) -> list:
+def forbidden_techniques(spec: dict, family: str = None) -> list:
     """Impossible techniques named anywhere in a proposed strategy.
 
     Normalises Unicode dashes first: models write "target-encoded" with U+2011 often
     enough that an ASCII-only pattern silently reports a clean result.
     """
+    if family == "stack":
+        # A stacking run exists precisely to build a meta-learner over other models' OOF
+        # predictions. This guard was written when that was impossible in a plugin; for the
+        # stack family it is the goal, and leaving it on rejected the orchestrator's own
+        # correct proposals.
+        return []
     blob = unicodedata.normalize("NFKC", json.dumps(spec, ensure_ascii=False))
     return sorted({m.group(0).lower() for m in FORBIDDEN.finditer(blob.translate(_DASH))})
 
@@ -301,7 +307,7 @@ def _used_refs() -> set:
             "AND playbook_ref IS NOT NULL")}
 
 
-def strategy_schema() -> dict:
+def strategy_schema(family: str = families.DEFAULT) -> dict:
     """STRATEGY_SCHEMA with playbook_ref constrained to the ideas still on the menu.
 
     A schema enum is enforced by the decoder, so this is the one instruction the model
@@ -317,7 +323,12 @@ def strategy_schema() -> dict:
             "AND playbook_ref IS NOT NULL")}
     fresh = [i for i in ids if i not in used]
     schema = copy.deepcopy(prompts.STRATEGY_SCHEMA)
-    schema["properties"]["playbook_ref"]["enum"] = (fresh or ids) + ["other"]
+    # `fresh or ids` was wrong: once every entry had been used the fallback re-offered the
+    # whole list, so the exclusion silently switched itself off exactly when it was needed
+    # -- one run picked no_te_members four times. An exhausted menu should say so, not
+    # pretend to be full.
+    schema["properties"]["playbook_ref"]["enum"] = fresh + ["other"]
+    schema["properties"]["model_family"]["enum"] = families.get(family)["model_family"]
     return schema
 
 
@@ -331,7 +342,49 @@ def unused_playbook_refs() -> list:
     return [i for i in ids if i not in used]
 
 
-def propose(model: str = None, tries: int = 4) -> dict:
+def blend_block() -> str:
+    """Tell the orchestrator a blender exists and what that changes about its job.
+
+    Without this the loop optimises solo CV and nothing else, which is the wrong objective
+    once members are stacked: nine GBM members correlating at 0.98-0.998 produced a blend
+    gain of +0.00025 where the playbook measured +0.0004, purely because they were near
+    copies of each other. A member that scores slightly lower but disagrees can be worth
+    more to the stack than a marginally better clone.
+
+    It is deliberately NOT an invitation to chase decorrelation for its own sake -- SPEC 3.3
+    is explicit that contribution tracks solo OOF and that members below 0.966 contributed
+    zero or sign-flipping weight despite being the least correlated. Strong AND different is
+    the bar; different alone is not.
+    """
+    with ledger.conn() as c:
+        row = c.execute(
+            "SELECT exp_id, cv_auc, actual_lb, spec_json FROM experiments "
+            "WHERE family='blend' AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return ""
+    eid, cv, lb, spec_json = row
+    try:
+        members = json.loads(spec_json or "{}").get("members", [])
+    except Exception:
+        members = []
+    lb_txt = f", public LB {lb:.5f}" if lb else ""
+    return (
+        "\n=== YOUR MEMBERS ARE STACKED ===\n"
+        f"The harness blends stored out-of-fold predictions. The current best blend is "
+        f"`{eid}` at CV {cv:.6f}{lb_txt}, built from: {', '.join(members) or 'n/a'}.\n"
+        "Your strategy does not have to beat the best single model on its own. A member that "
+        "scores a little lower but makes DIFFERENT mistakes can earn more weight in the stack "
+        "than one more near-copy of the current best. The existing members agree with each "
+        "other far too closely, which is why the blend gains so little.\n"
+        "But different is not sufficient: a member below roughly 0.966 solo has historically "
+        "contributed nothing at all, whatever its correlation. Aim for strong AND unlike what "
+        "is already there.\n"
+    )
+
+
+def propose(model: str = None, tries: int = 4,
+            family: str = families.DEFAULT) -> dict:
     """Propose the next strategy, rejecting any that cannot physically be implemented.
 
     Rejection is cheap (~30s of generation) and the alternative is not: an impossible
@@ -340,9 +393,12 @@ def propose(model: str = None, tries: int = 4) -> dict:
     """
     ctx = build_context()
     # The constraints come BEFORE the history so they are not buried under it.
-    base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n"
+    fam = families.get(family)
+    base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n\n"
+            f"{fam['guidance']}\n"
+            f"{blend_block()}"
             f"{backlog_block()}\n{ctx}\n\n"
-            f"Propose the next strategy as JSON.")
+            f"Propose the next strategy as JSON. It must use a {fam['label']} model.")
     bad = []
     for attempt in range(tries):
         # Resample rather than appending a correction to the prompt: mutating the prompt
@@ -352,14 +408,14 @@ def propose(model: str = None, tries: int = 4) -> dict:
             model or ollama.ORCHESTRATOR,
             prompts.ORCH_SYSTEM,
             base,
-            strategy_schema(),
+            strategy_schema(family),
             temperature=0.6,  # some spread, or every iteration proposes the same thing
             # Headroom, not a fit: a reasoning orchestrator spends most of this thinking
             # before it emits a token of JSON, and 1200 was already marginal at 3
             # iterations of history. chat() doubles this on empty or truncated output.
             num_predict=4096,
         )
-        bad = forbidden_techniques(spec)
+        bad = forbidden_techniques(spec, family)
         if bad:
             print(f"    [rejected {attempt+1}/{tries}: proposes {', '.join(bad)} -- "
                   f"make_features never sees the target]", flush=True)

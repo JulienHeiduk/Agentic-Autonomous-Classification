@@ -1,10 +1,11 @@
 """Coder and repairer: turn a strategy into a runnable plugin, and fix it when it breaks."""
 import json
 
-from agents import ollama, prompts
+from agents import families, ollama, prompts
 
 
-def write_plugin(spec: dict, model: str = None, base: dict = None) -> str:
+def write_plugin(spec: dict, model: str = None, base: dict = None,
+                 family: str = None) -> str:
     """Turn a strategy into a plugin, mutating the best plugin so far when there is one.
 
     `base` is what makes the recursion reach the code. Given one, the model edits a file
@@ -32,10 +33,28 @@ def write_plugin(spec: dict, model: str = None, base: dict = None) -> str:
             f"exactly; change the feature engineering and the model to match the strategy "
             f"above:\n\n{prompts.EXAMPLE_PLUGIN}\n"
         )
+    # The family guidance comes AFTER the contract and overrides it where they disagree.
+    # They do disagree, on the rule that matters most: the contract says leaving NaN in a
+    # numeric column is the safe default, which is true for a tree and fatal for a linear
+    # model. Without this the coder wrote a bare LogisticRegression and the run died on
+    # "Input X contains NaN".
+    fam = families.get(family or spec.get("orchestrator") or families.DEFAULT)
+    extra = ""
+    if (family or spec.get("orchestrator")) == "stack":
+        # The column names are experiment ids and cannot be guessed. Naming them here is
+        # the difference between a plugin that indexes its frame and one that dies on a
+        # KeyError for a column it invented.
+        from harness import blend as _blend
+        names = _blend.member_names()
+        extra = ("\nTHE EXACT COLUMNS IN YOUR train/test FRAMES (plus `id`, and "
+                 "`addicted_label` in train only, both of which you must drop):\n"
+                 + "\n".join(f"    {n}   (solo AUC {cv:.6f})" for n, cv in names)
+                 + "\nUse these names literally. Do not invent column names.\n")
     user = (
         f"{prompts.TASK}\n\n"
         f"STRATEGY TO IMPLEMENT:\n{strategy}\n\n"
         f"{prompts.CONTRACT}\n\n"
+        f"{fam['guidance']}\n{extra}\n"
         f"{anchor}"
     )
     txt = ollama.chat(
@@ -46,7 +65,7 @@ def write_plugin(spec: dict, model: str = None, base: dict = None) -> str:
 
 
 def repair(code: str, error: str, spec: dict, model: str = None,
-           previous_errors: list = None, attempt: int = 0) -> str:
+           previous_errors: list = None, attempt: int = 0, family: str = None) -> str:
     """Fix a failing plugin. `attempt` raises the temperature on successive tries.
 
     The first attempt stays deterministic: a precise error deserves a precise edit. After
@@ -73,7 +92,8 @@ def repair(code: str, error: str, spec: dict, model: str = None,
         f"=== FILE ===\n```python\n{code}\n```\n\n"
         f"=== CURRENT ERROR ===\n{error}\n"
         f"{history}\n"
-        f"{prompts.CONTRACT}\n"
+        f"{prompts.CONTRACT}\n\n"
+        f"{families.get(family or spec.get('orchestrator') or families.DEFAULT)['guidance']}\n\n"
         f"Return the complete corrected file."
     )
     txt = ollama.chat(

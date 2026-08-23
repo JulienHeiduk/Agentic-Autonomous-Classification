@@ -24,9 +24,9 @@ import re
 import time
 import traceback
 
-from agents import coder, ollama, orchestrator
+from agents import coder, families, ollama, orchestrator
 from harness import config as C
-from harness import evaluate, ledger, report, sandbox
+from harness import blend, evaluate, ledger, report, sandbox
 from harness.data import load
 
 
@@ -72,8 +72,8 @@ def error_signature(err: str) -> str:
     return first[:120]
 
 
-def inherit_base():
-    """The best plugin the loop has produced, as source for the next iteration to mutate.
+def inherit_base(family: str = None):
+    """The best plugin THIS FAMILY has produced, as source for the next iteration to mutate.
 
     This is the code-level half of the recursion. build_context() already carries strategy
     and results forward; without this the coder rebuilt every implementation from a prose
@@ -90,13 +90,22 @@ def inherit_base():
     contract has tightened since older plugins were written, and handing the coder a base
     that no longer passes would fail the iteration before it starts.
     """
+    # Filtered by family, because a base from another family is worse than none: handing a
+    # linear run the best CatBoost plugin tells the coder to mutate a tree while the strategy
+    # says use a linear model, and the mutation prompt asks it to keep everything the strategy
+    # did not mention. Each family climbs its own hill; a family with no promoted member yet
+    # gets the reference example, which is the correct cold start.
+    allowed = set(families.get(family)["model_family"]) if family else None
     with ledger.conn() as c:
         rows = c.execute(
-            "SELECT exp_id, cv_auc, actual_lb FROM experiments WHERE family='loop' "
+            "SELECT exp_id, cv_auc, actual_lb, json_extract(spec_json, '$.model_family') "
+            "FROM experiments WHERE family='loop' "
             "AND cv_auc IS NOT NULL AND status IN ('promoted', 'baseline') "
             "ORDER BY cv_auc DESC"
         ).fetchall()
-    for exp_id, cv, lb in rows:
+    for exp_id, cv, lb, mf in rows:
+        if allowed is not None and mf not in allowed:
+            continue
         path = sandbox.PLUGINS / f"{exp_id}.py"
         if not path.exists():
             continue
@@ -161,7 +170,8 @@ def iteration(n: int, args) -> dict:
         # comparable sat unseen below this cut for six iterations.
         print(f"    | ... {len(lines) - len(shown)} more lines sent to the model but not "
               f"printed ({len(ctx)} chars total)", flush=True)
-    spec = orchestrator.propose()
+    spec = orchestrator.propose(family=args.family)
+    spec["orchestrator"] = args.family
     print(f"\n[strategy] {spec['strategy_name']}")
     print(f"  hypothesis : {spec['hypothesis']}")
     print(f"  asks       : {spec['what_it_lets_the_model_ask']}")
@@ -178,14 +188,17 @@ def iteration(n: int, args) -> dict:
     )
 
     # ---- 2. write the code ------------------------------------------------------
-    base = None if getattr(args, "no_inherit", False) else inherit_base()
+    # A stacking run trains on the member matrix, so --rows subsampling and the
+    # target-encoding injection do not apply to it.
+    is_stack = args.family == "stack"
+    base = None if args.no_inherit else inherit_base(args.family)
     if base:
         lb_txt = f", LB {base['lb']:.5f}" if base.get("lb") else ""
         print(f"\n[coder] writing plugin (mutating {base['exp_id']}, "
               f"CV {base['cv']:.6f}{lb_txt})...", flush=True)
     else:
         print("\n[coder] writing plugin (from the reference example)...", flush=True)
-    code = coder.write_plugin(spec, base=base)
+    code = coder.write_plugin(spec, base=base, family=args.family)
     print(f"    {len(code.splitlines())} lines", flush=True)
 
     # ---- 3. preflight on a tiny subsample, repairing until it runs ---------------
@@ -196,7 +209,7 @@ def iteration(n: int, args) -> dict:
         label = "preflight" if attempt == 0 else f"preflight after repair {attempt}"
         print(f"\n[sandbox] {label} ({PREFLIGHT_ROWS:,} rows)...", flush=True)
         ok, result, _ = sandbox.execute(exp_id, code, timeout=PREFLIGHT_TIMEOUT,
-                                        rows=PREFLIGHT_ROWS)
+                                        rows=PREFLIGHT_ROWS, stack=is_stack)
         if ok:
             print(f"    preflight OK (auc {result['cv_auc']:.4f}, "
                   f"{result['n_features']} features)", flush=True)
@@ -224,13 +237,14 @@ def iteration(n: int, args) -> dict:
             print(f"[repairer] attempt {attempt+1}/{args.repairs}"
                   f" (temp {min(0.6, 0.15 * attempt):.2f})...", flush=True)
             code = coder.repair(code, err, spec, previous_errors=seen_errors,
-                                attempt=attempt)
+                                attempt=attempt, family=args.family)
         seen_errors.append(err)
 
     # ---- 3b. the real run on the frozen split -----------------------------------
     if ok and not args.rows:
         print("\n[sandbox] full run on the frozen 5-fold split...", flush=True)
-        ok, result, _ = sandbox.execute(exp_id, code, timeout=args.timeout)
+        ok, result, _ = sandbox.execute(exp_id, code, timeout=args.timeout,
+                                        stack=is_stack)
         if not ok:
             err = str(result.get("error", ""))
             print("    FAILED:\n" + "\n".join("      " + l for l in err.splitlines()[:18]),
@@ -298,9 +312,14 @@ def main():
     p.add_argument("--timeout", type=int, default=2400)
     p.add_argument("--rows", type=int, default=None,
                    help="train on the first N rows only (fast screening; disables submit)")
+    p.add_argument("--family", default=families.DEFAULT, choices=families.names(),
+                   help="which model family this run explores; each has its own "
+                        "estimator set and its own contract (see agents/families.py)")
     p.add_argument("--no-inherit", action="store_true",
                    help="write each plugin from the reference example instead of "
                         "mutating the best one so far (wider exploration)")
+    p.add_argument("--no-blend", action="store_true",
+                   help="skip the stacking pass at the end of the run")
     p.add_argument("--no-submit", dest="submit", action="store_false")
     p.set_defaults(submit=True)
     args = p.parse_args()
@@ -309,7 +328,7 @@ def main():
         raise SystemExit("ollama is not reachable at localhost:11434 -- start it first")
 
     _rule("AGENTIC AUTONOMOUS CLASSIFICATION")
-    print(f"  orchestrator : {ollama.ORCHESTRATOR}")
+    print(f"  orchestrator : {ollama.ORCHESTRATOR}  [{args.family} family]")
     print(f"  coder        : {ollama.CODER}")
     print(f"  iterations   : {args.iterations}")
     print(f"  submit       : {args.submit and not args.rows}")
@@ -340,6 +359,20 @@ def main():
     fl, src = measured_noise_floor()
     print(f"\n  best CV overall: {best_cv():.6f}")
     print(f"  noise floor    : {fl:.6f} [{src}]")
+
+    # Blend AFTER the iterations, not during: greedy selection is O(n^2) stacker fits, and
+    # a run's members are only worth re-stacking once they all exist. Without this the loop
+    # produced members and never combined them -- the blender was a manual step nothing
+    # invoked, so every new member sat unused until someone remembered.
+    if not args.no_blend:
+        _rule("BLEND")
+        try:
+            blend.build()
+        except SystemExit as e:
+            print(f"  skipped: {e}")
+        except Exception as e:
+            # A failed blend must not lose the iterations that just succeeded.
+            print(f"  blend failed: {type(e).__name__}: {e}")
 
     report.main()
 
