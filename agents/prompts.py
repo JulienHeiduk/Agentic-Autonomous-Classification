@@ -1,52 +1,25 @@
 """Shared prompt material.
 
+Generated from the data where it can be: TASK, EXAMPLE_PLUGIN and the categorical recipe all
+come from harness.profile via agents.describe, so this module names no column of any
+particular dataset.
+
 Everything a small model needs in order to be useful here is stated explicitly. A 7-9B
 model will not infer the plugin contract, the column list, or the fact that the harness
 owns cross-validation -- so all three are spelled out every time.
 """
 
-TASK = """\
-COMPETITION: Kaggle Playground S6E8 -- predict `addicted_label` (binary) from smartphone usage.
-METRIC: ROC AUC (ranking only -- calibration does not matter).
-DATA: train.csv 691,369 rows; test.csv 296,302 rows. Positive rate 0.709.
+# TASK and EXAMPLE_PLUGIN are GENERATED from the data, not written here. The previous
+# versions named this competition's columns directly, so pointing the loop at another
+# dataset produced strategies for columns that did not exist. agents/describe.py renders
+# both from harness.profile; data/NOTES.md is appended to TASK when present, which is where
+# domain knowledge a profiler cannot infer belongs.
+from agents import describe
+from harness import profile as _profile
 
-COLUMNS
-  numeric (9):     age, daily_screen_time_hours, social_media_hours, gaming_hours,
-                   work_study_hours, sleep_hours, notifications_per_day,
-                   app_opens_per_day, weekend_screen_time
-  categorical (3): gender {Male,Female,Other}, stress_level {Low,Medium,High},
-                   academic_work_impact {Yes,No}
-  target:          addicted_label (0/1)   -- present in train only
-  id:              id                     -- present in both, NOT a feature
+TASK = describe.task()
 
-EVERY column has 4%-19% missing values.
-
-MEASURED FACTS ABOUT THIS DATASET (verified, use them):
-  1. Generator invariant: daily_screen_time_hours = social_media_hours + gaming_hours
-     + work_study_hours + other, with other >= 0 and ZERO violations. The leftover
-     `resid = daily - (social + gaming + work)` is a real quantity.
-  2. notifications_per_day and app_opens_per_day are LOOKUP KEYS, not quantities.
-     Adjacent integer values differ in target rate by 0.22 on average. Treat them as
-     high-cardinality categories, not as magnitudes.
-  3. The first decimal digit of the hour columns swings the target rate by 8.5 points.
-     It is a generator fingerprint. floor(x*10) % 10 is a real feature.
-  4. Missingness is informative enough to be worth explicit flags (x.isna()).
-  5. Gradient-boosted trees handle NaN natively. If you impute, ADD the imputed column
-     next to the original -- replacing the NaN column makes results WORSE.
-
-PROVIDED FOR YOU -- the harness has ALREADY encoded the two lookup keys and put the results
-in `train` and `test` before you see them:
-
-     te_notifications_per_day     te_app_opens_per_day     (out-of-fold target encoding)
-     freq_notifications_per_day   freq_app_opens_per_day   (frequency, fitted on train)
-
-  Use them like any other numeric column. Do NOT rebuild either one. The te_ columns are
-  computed out-of-fold against the split you are scored on and are leak-free; the freq_
-  columns are fitted on train and applied to both frames, which is the part that is easy to
-  get wrong by hand.
-"""
-
-CONTRACT = '''\
+_CONTRACT_TMPL = '''\
 PLUGIN CONTRACT -- your file must define exactly these two functions and nothing else at
 module level except imports and constants:
 
@@ -63,14 +36,14 @@ RULES -- violating any of these fails the run:
   * The harness owns cross-validation. DO NOT write a fold loop, DO NOT compute AUC,
     DO NOT touch the target inside make_features. You never see y.
   * `train` and `test` ALREADY CONTAIN `te_<key>` (out-of-fold target encoding) and
-    `freq_<key>` (train-fitted frequency) for notifications_per_day and app_opens_per_day.
-    Keep them in X -- they are there by default if you only drop `id` and `addicted_label`.
+    `freq_<key>` (train-fitted frequency) for each high-cardinality key named in the task.
+    Keep them in X -- they are there by default if you only drop the id and target columns.
     Never rebuild them.
   * te_<key> and freq_<key> are FLOAT columns, not categories. NEVER name them in
     cat_features / categorical_feature -- LightGBM fails with "Could not find
-    categorical_feature te_notifications_per_day in data file". The only categorical
-    columns are gender, stress_level and academic_work_impact, and the recipe below turns
-    those into integer codes, so you do not need cat_features at all.
+    categorical_feature te_<key> in data file". The only categorical
+    columns are the low-cardinality ones listed in the task above, and the recipe below
+    turns those into integer codes, so you do not need cat_features at all.
   * NEVER FIT A MAPPING INSIDE make_features. It is called ONCE for train and ONCE for test,
     so anything fitted from the frame it is given -- `value_counts()`, a fitted encoder, a
     per-frame mean or normalisation -- produces a DIFFERENT mapping for each frame. The run
@@ -80,9 +53,9 @@ RULES -- violating any of these fails the run:
         RIGHT:  use the provided freq_<c> column.
   * `te_` and `freq_` are RESERVED prefixes belonging to the harness. Use those columns, and
     derive from them freely, but do not name a feature of your own with either prefix.
-  * Drop `id` and `addicted_label` from X_train. X_train and X_test must have IDENTICAL
-    column names in the same order.
-  * X_train must have exactly 691369 rows, X_test exactly 296302 rows. Never drop rows.
+  * Drop the id and target columns (named in the task above) from X_train. X_train and
+    X_test must have IDENTICAL column names in the same order.
+  * X_train and X_test must keep EXACTLY the row counts given in the task. Never drop rows.
   * The harness calls `model.fit(X, y)` with NO extra arguments. Your estimator must work
     that way. You CANNOT pass cat_features, eval_set, early_stopping or sample weights at
     fit time -- put everything in the constructor, and set a fixed n_estimators.
@@ -124,7 +97,7 @@ Use exactly this shape. One function builds both frames, and the last line force
 train's columns and order:
 
     def _fe(df):
-        X = df.drop(columns=["id", "addicted_label"], errors="ignore").copy()
+        X = df.drop(columns=[ID_COL, TARGET_COL], errors="ignore").copy()
         ...                                   # EVERY feature is added in here
         return X
 
@@ -135,19 +108,14 @@ train's columns and order:
 
   * Put every feature inside _fe(). Never add one to X_train or X_test afterwards.
   * Never make a column conditional on the frame -- no `if c in df.columns`, no `if
-    "addicted_label" in df`. A conditional column exists in one frame and not the other.
+    target in df`. A conditional column exists in one frame and not the other.
   * Do not reorder or select columns after that last line.
 
 CATEGORICAL COLUMNS -- USE EXACTLY THIS, ALWAYS. Do not use pandas `category` dtype and do
 not use LabelEncoder. Integer codes work identically for every engine, handle NaN, and
 guarantee train and test agree:
 
-    LEVELS = {"gender": ["Female", "Male", "Other"],
-              "stress_level": ["Low", "Medium", "High"],
-              "academic_work_impact": ["No", "Yes"]}
-
-    for c, lv in LEVELS.items():
-        X[c] = pd.Categorical(X[c], categories=lv).codes.astype(np.int8)   # NaN -> -1
+%%CATEGORICAL_RECIPE%%
 
   Anything else -- `category` dtype without cat_features, LabelEncoder, get_dummies with
   differing columns between train and test -- fails. This recipe does not.
@@ -177,7 +145,7 @@ OUT -- never propose these:
 
 IN -- all of these work:
   * TARGET ENCODING and FREQUENCY ENCODING, already built and supplied: `te_<key>` and
-    `freq_<key>` for both lookup keys are in the data before the plugin runs. Propose
+    `freq_<key>` for every high-cardinality key are in the data before the plugin runs. Propose
     strategies that USE them -- interactions, binning, combining with the raw keys. Do not
     propose creating them, and never propose a feature fitted separately on train and test:
     that produces a CV that does not survive the leaderboard, and the run is rejected.
@@ -210,10 +178,11 @@ You are judged on whether each iteration is MEANINGFULLY DIFFERENT from the last
 whether it improves out-of-fold AUC. Repeating the previous iteration with a tweaked \
 learning rate is a wasted iteration.
 
-Target encoding of the two lookup keys is ALREADY DONE for you: `te_notifications_per_day` \
-and `te_app_opens_per_day` arrive in the data, computed out-of-fold by the harness. Build on \
-them rather than proposing to create them, and never propose computing target statistics \
-inside the plugin -- the feature step is not given the target column.
+Target and frequency encoding of the high-cardinality keys is ALREADY DONE for you: the \
+`te_<key>` and `freq_<key>` columns named in the task arrive in the data, computed \
+out-of-fold by the harness. Build on them rather than proposing to create them, and never \
+propose computing target statistics inside the plugin -- the feature step is not given the \
+target column.
 
 Respond with JSON only."""
 
@@ -257,41 +226,11 @@ STRATEGY_SCHEMA = {
     ],
 }
 
-EXAMPLE_PLUGIN = '''```python
-import numpy as np
-import pandas as pd
-import lightgbm as lgb
-
-NUMS = ["age", "daily_screen_time_hours", "social_media_hours", "gaming_hours",
-        "work_study_hours", "sleep_hours", "notifications_per_day",
-        "app_opens_per_day", "weekend_screen_time"]
-LEVELS = {"gender": ["Female", "Male", "Other"],
-          "stress_level": ["Low", "Medium", "High"],
-          "academic_work_impact": ["No", "Yes"]}
+EXAMPLE_PLUGIN = describe.example_plugin()
 
 
-def _fe(df):
-    X = df.drop(columns=["id", "addicted_label"], errors="ignore").copy()
-    for c in NUMS:
-        X[f"na_{c}"] = X[c].isna().astype(np.int8)
-    X["resid"] = X["daily_screen_time_hours"] - (
-        X["social_media_hours"] + X["gaming_hours"] + X["work_study_hours"])
-    # first decimal digit -- stays float because the column contains NaN
-    X["d1_daily"] = np.floor(X["daily_screen_time_hours"] * 10) % 10
-    for c, lv in LEVELS.items():
-        X[c] = pd.Categorical(X[c], categories=lv).codes.astype(np.int8)
-    return X
-
-
-def make_features(train, test):
-    X_train = _fe(train)
-    X_test = _fe(test)[X_train.columns]
-    return X_train, X_test
-
-
-def make_model(seed):
-    return lgb.LGBMClassifier(
-        n_estimators=800, learning_rate=0.05, num_leaves=63,
-        colsample_bytree=0.8, subsample=0.8, subsample_freq=1,
-        min_child_samples=100, random_state=seed, n_jobs=-1, verbose=-1)
-```'''
+_P = _profile.profile()
+CONTRACT = (_CONTRACT_TMPL
+            .replace("%%CATEGORICAL_RECIPE%%", describe.categorical_recipe(_P))
+            .replace("ID_COL", repr(_P["id"]))
+            .replace("TARGET_COL", repr(_P["target"])))
