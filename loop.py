@@ -42,18 +42,26 @@ def _rule(txt=""):
     print(f"\n{'='*78}\n{txt}\n{'='*78}" if txt else "=" * 78, flush=True)
 
 
-def best_loop_run():
-    """(exp_id, cv) of the best experiment the LOOP itself has produced, or (None, 0.0).
+def best_loop_run(family: str = None):
+    """(exp_id, cv) of the best experiment THIS FAMILY has produced, or (None, 0.0).
 
-    Deliberately excludes the reference pipeline: the loop's progress is measured against
-    its own trajectory, so iteration 2 is judged on whether it beat iteration 1.
+    Excludes the reference pipeline: the loop's progress is measured against its own
+    trajectory, so iteration 2 is judged on whether it beat iteration 1.
+
+    Scoped by family, because judging across families is not a comparison -- it is a
+    guarantee of failure. A linear member measured against a GBM's 0.965142 is rejected
+    whatever it scores; being rejected it never becomes an inheritable base; and a family
+    with no base never improves. The family would be permanently stuck at iteration one.
     """
     with ledger.conn() as c:
-        r = c.execute(
-            "SELECT exp_id, cv_auc FROM experiments WHERE family='loop' "
-            "AND cv_auc IS NOT NULL ORDER BY cv_auc DESC LIMIT 1"
-        ).fetchone()
-    return (r[0], r[1]) if r else (None, 0.0)
+        rows = c.execute(
+            "SELECT exp_id, cv_auc, spec_json FROM experiments WHERE family='loop' "
+            "AND cv_auc IS NOT NULL ORDER BY cv_auc DESC"
+        ).fetchall()
+    for exp_id, cv, spec_json in rows:
+        if orchestrator.belongs_to(spec_json, family):
+            return exp_id, cv
+    return (None, 0.0)
 
 
 RESET_AFTER = 3   # repairs on one file before abandoning it for the known-good base
@@ -160,7 +168,11 @@ def iteration(n: int, args) -> dict:
 
     # ---- 1. plan, with every previous result as context -------------------------
     print("[orchestrator] reading feedback from previous iterations...", flush=True)
-    ctx = orchestrator.build_context()
+    # Must pass the family. Without it this printed the WHOLE loop history while
+    # propose() correctly sent the family's own -- so the log showed ten CatBoost
+    # iterations to a linear run that was in fact starting cold. A display that
+    # disagrees with the prompt is worse than no display.
+    ctx = orchestrator.build_context(args.family)
     lines = ctx.splitlines()
     shown = lines[:40]
     print("\n".join("    | " + l for l in shown), flush=True)
@@ -250,7 +262,7 @@ def iteration(n: int, args) -> dict:
             print("    FAILED:\n" + "\n".join("      " + l for l in err.splitlines()[:18]),
                   flush=True)
 
-    prev_id, prev_best = best_loop_run()
+    prev_id, prev_best = best_loop_run(args.family)
 
     if not ok:
         verdict = coder.critique(spec, result, prev_best)
@@ -332,7 +344,7 @@ def main():
     print(f"  coder        : {ollama.CODER}")
     print(f"  iterations   : {args.iterations}")
     print(f"  submit       : {args.submit and not args.rows}")
-    print(f"  best CV now  : {best_cv():.6f}")
+    print(f"  best CV now  : {best_loop_run(args.family)[1]:.6f} ({args.family} family)")
 
     # continue the numbering from what the ledger already holds, so a second invocation
     # produces iteration 3, not another iteration 1

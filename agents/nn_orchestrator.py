@@ -17,4 +17,4 @@ def propose(model: str = None, tries: int = 4) -> dict:
 
 
 def build_context() -> str:
-    return orchestrator.build_context()
+    return orchestrator.build_context(FAMILY)

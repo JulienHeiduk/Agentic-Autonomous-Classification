@@ -14,14 +14,38 @@ from agents import families, ollama, prompts
 from harness import ledger
 
 
-def history():
-    """Every completed loop iteration, oldest first."""
+def belongs_to(spec_json, family: str) -> bool:
+    """Is this experiment part of `family`?
+
+    Newer rows carry `orchestrator` in their spec; older ones predate the family split, so
+    fall back to whether the estimator they chose is in that family's enum.
+    """
+    if not family:
+        return True
+    try:
+        sp = json.loads(spec_json or "{}")
+    except Exception:
+        return False
+    if sp.get("orchestrator"):
+        return sp["orchestrator"] == family
+    return sp.get("model_family") in set(families.get(family)["model_family"])
+
+
+def history(family: str = None):
+    """Completed loop iterations, oldest first, restricted to one family.
+
+    Family-scoped because a linear run shown ten CatBoost strategies imitates them -- the
+    same precedent-beats-instruction effect measured all through this project -- and because
+    "BEST CV SO FAR" taken across families is a number the linear family cannot reach, which
+    makes every honest linear result read as a failure.
+    """
     with ledger.conn() as c:
-        return c.execute(
+        rows = c.execute(
             "SELECT e.exp_id, e.hypothesis, e.cv_auc, e.actual_lb, e.status, e.verdict, "
             "e.spec_json, e.runtime_s "
             "FROM experiments e WHERE e.family='loop' ORDER BY e.ts"
         ).fetchall()
+    return [r for r in rows if belongs_to(r[6], family)]
 
 
 # Per-field caps for a full-detail entry. Capping how MANY iterations are replayed is not
@@ -57,7 +81,7 @@ def _is_comparable(status, cv):
     return cv is not None and status not in ("screening", "failed", "running")
 
 
-def build_context() -> str:
+def build_context(family: str = None) -> str:
     """The feedback block handed to the next iteration.
 
     Two things this deliberately does NOT do, both learned the hard way:
@@ -72,7 +96,7 @@ def build_context() -> str:
     and was already 38% of num_ctx at ten of them; left alone it crowds out the reasoning
     and the answer, which is the truncation that returns empty content with no error.
     """
-    rows = history()
+    rows = history(family)
     if not rows:
         return (
             "ITERATION 1 of this loop. Nothing has been tried yet.\n\n"
@@ -266,7 +290,7 @@ def _fingerprint(spec_or_row) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", t)
 
 
-def too_similar(spec: dict):
+def too_similar(spec: dict, family: str = None):
     """(exp_id, ratio) of a past iteration this strategy repeats, or None.
 
     The prompt has asked for a MEANINGFULLY DIFFERENT strategy from the start, and nine of
@@ -279,7 +303,7 @@ def too_similar(spec: dict):
     if not new:
         return None
     worst = None
-    for eid, hyp, cv, lb, status, verdict, spec_json, rt in history():
+    for eid, hyp, cv, lb, status, verdict, spec_json, rt in history(family):
         prev = None
         if spec_json:
             try:
@@ -300,11 +324,14 @@ def too_similar(spec: dict):
     return worst
 
 
-def _used_refs() -> set:
+def _used_refs(family: str = None) -> set:
+    """Playbook entries this family has already used. Scoped, because `seed_averaging` tried
+    on trees says nothing about `seed_averaging` tried on a linear model."""
     with ledger.conn() as c:
-        return {r[0] for r in c.execute(
-            "SELECT playbook_ref FROM experiments WHERE family='loop' "
-            "AND playbook_ref IS NOT NULL")}
+        rows = c.execute(
+            "SELECT playbook_ref, spec_json FROM experiments WHERE family='loop' "
+            "AND playbook_ref IS NOT NULL").fetchall()
+    return {r[0] for r in rows if belongs_to(r[1], family)}
 
 
 def strategy_schema(family: str = families.DEFAULT) -> dict:
@@ -318,9 +345,7 @@ def strategy_schema(family: str = families.DEFAULT) -> dict:
     with ledger.conn() as c:
         ids = [r[0] for r in c.execute(
             "SELECT idea_id FROM backlog WHERE status='queued' ORDER BY priority DESC")]
-        used = {r[0] for r in c.execute(
-            "SELECT playbook_ref FROM experiments WHERE family='loop' "
-            "AND playbook_ref IS NOT NULL")}
+    used = _used_refs(family)
     fresh = [i for i in ids if i not in used]
     schema = copy.deepcopy(prompts.STRATEGY_SCHEMA)
     # `fresh or ids` was wrong: once every entry had been used the fallback re-offered the
@@ -336,9 +361,7 @@ def unused_playbook_refs() -> list:
     with ledger.conn() as c:
         ids = [r[0] for r in c.execute(
             "SELECT idea_id FROM backlog WHERE status='queued' ORDER BY priority DESC")]
-        used = {r[0] for r in c.execute(
-            "SELECT playbook_ref FROM experiments WHERE family='loop' "
-            "AND playbook_ref IS NOT NULL")}
+    used = _used_refs()
     return [i for i in ids if i not in used]
 
 
@@ -391,7 +414,7 @@ def propose(model: str = None, tries: int = 4,
     strategy costs the coder's attempt plus every repair attempt plus a preflight run,
     and still ends the iteration with no measurement in the ledger.
     """
-    ctx = build_context()
+    ctx = build_context(family)
     # The constraints come BEFORE the history so they are not buried under it.
     fam = families.get(family)
     base = (f"{prompts.TASK}\n\n{prompts.STRATEGY_CONSTRAINTS}\n\n"
@@ -421,11 +444,11 @@ def propose(model: str = None, tries: int = 4,
                   f"make_features never sees the target]", flush=True)
             continue
         ref = spec.get("playbook_ref")
-        if ref and ref != "other" and ref in _used_refs() and attempt < tries - 1:
+        if ref and ref != "other" and ref in _used_refs(family) and attempt < tries - 1:
             print(f"    [rejected {attempt+1}/{tries}: playbook_ref '{ref}' already "
                   f"used -- pick an idea that has not been tried]", flush=True)
             continue
-        dup = too_similar(spec)
+        dup = too_similar(spec, family)
         if dup and attempt < tries - 1:
             # Not on the last attempt: a repeat still beats no strategy at all.
             print(f"    [rejected {attempt+1}/{tries}: {dup[1]:.0%} similar to "
