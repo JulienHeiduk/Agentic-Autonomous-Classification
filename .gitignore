@@ -11,6 +11,8 @@ data/
 state/
 artifacts/
 external_oof/
+# pulled third-party notebooks -- not ours to redistribute
+external_kernels/
 plugins/
 reports/
 ROADMAP.md
