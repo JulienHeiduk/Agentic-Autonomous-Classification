@@ -27,8 +27,13 @@ YOUR FAMILY: gradient-boosted trees (LightGBM, XGBoost, CatBoost, HistGradientBo
   * Feed the categorical columns as integer codes (the pd.Categorical recipe). No one-hot,
     no scaling -- trees are invariant to monotone transforms of a feature.
   * The high-cardinality lookup keys are usable raw; the te_/freq_ columns are there too.
-  * Depth and n_estimators are the levers that matter. Keep them inside the smoke-test
-    budget.""",
+  * Depth and the tree count are the levers that matter, but THE ARGUMENT NAMES DIFFER:
+        LightGBM / XGBoost         n_estimators, max_depth, n_jobs=-1
+        CatBoost                   iterations,   depth,     thread_count=-1
+        HistGradientBoosting       max_iter,     max_depth, and NO n_jobs at all
+    Passing n_estimators to HistGradientBoostingClassifier raises TypeError. Check the
+    argument names for the engine you actually chose. Keep the values inside the
+    smoke-test budget.""",
     },
     "linear": {
         "label": "linear and kernel-free convex models",

@@ -39,9 +39,10 @@ LOGIT_CLIP = 30.0        # SPEC 2: stack on clip(log(p/(1-p)), +-30), not probab
 RANKGAUSS_ABOVE = 25     # members above this count -> rank-gauss instead of logits
 KS_DRIFT_MAX = 0.10      # OOF vs test-prediction drift that disqualifies a member
 STACK_C = 1.0
+STACK_MAX_ITER = 4000
 
 
-def candidates():
+def candidates(include_public: bool = True):
     """Members eligible to enter a stack, strongest first.
 
     Only full-data runs on the frozen split have stored arrays at all -- screening and
@@ -54,7 +55,11 @@ def candidates():
     with ledger.conn() as c:
         rows = c.execute(
             "SELECT exp_id, cv_auc, json_extract(spec_json, '$.model_family') "
-            "FROM experiments WHERE cv_auc IS NOT NULL AND family != 'confirm' "
+            "FROM experiments WHERE cv_auc IS NOT NULL "
+            # A previous blend must not enter a new one. Its OOF column is already a fit
+            # over the other columns, so including it double-counts every member inside it
+            # and lets the stacker lean on a number it did not earn.
+            "AND family NOT IN ('confirm', 'blend', 'stack') "
             "ORDER BY cv_auc DESC"
         ).fetchall()
     out = []
@@ -64,6 +69,16 @@ def candidates():
         if not (C.PRED_DIR / f"{exp_id}.npy").exists():
             continue
         out.append({"exp_id": exp_id, "cv": cv, "model_family": fam})
+
+    if include_public:
+        # Publicly shared members (SPEC 2.5). They go through the SAME quarantine as ours --
+        # dedupe, degenerate, drift -- and earn their slot by the same greedy criterion.
+        # They are worth including because diversity is what the stack is short of: ours
+        # correlate at 0.98-0.998, the public pool cross-correlates with ours at ~0.95.
+        from harness import ingest
+        for name, oof, pred in ingest.members():
+            out.append({"exp_id": name, "cv": None, "model_family": "public",
+                        "_arrays": (oof, pred)})
     return out
 
 
@@ -82,7 +97,10 @@ def quarantine(members, y):
     """
     kept, dropped, seen = [], [], {}
     for m in members:
-        oof, pred = ledger.load_arrays(m["exp_id"])
+        if "_arrays" in m:
+            oof, pred = m["_arrays"]
+        else:
+            oof, pred = ledger.load_arrays(m["exp_id"])
         if len(oof) != len(y) or len(pred) != C.N_TEST:
             dropped.append((m["exp_id"], f"wrong length {len(oof)}/{len(pred)}"))
             continue
@@ -127,6 +145,27 @@ def transform(arrs, n_members):
     return np.column_stack([f(a) for a in arrs])
 
 
+def _fit_stacker(X, y, C_reg):
+    """L2 logistic on scaled inputs, with convergence asserted.
+
+    Both requirements are from SPEC 2.5 and both are silent when violated: StandardScaler is
+    called mandatory there, and "a non-converged lbfgs fit READS HIGHER THAN THE TRUTH" --
+    which is a leakage-shaped failure, an inflated number with nothing visibly wrong.
+    """
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    pipe = Pipeline([("scale", StandardScaler()),
+                     ("clf", LogisticRegression(C=C_reg, max_iter=STACK_MAX_ITER))])
+    pipe.fit(X, y)
+    clf = pipe.named_steps["clf"]
+    if int(np.max(clf.n_iter_)) >= STACK_MAX_ITER:
+        raise RuntimeError(
+            f"stacker did not converge ({int(np.max(clf.n_iter_))} >= {STACK_MAX_ITER} "
+            f"iterations). A non-converged fit reports a higher AUC than it earns; refusing "
+            f"to record it. Raise STACK_MAX_ITER or reduce the member count.")
+    return pipe
+
+
 def nested_stack(X, y, splits, C_reg=STACK_C):
     """Out-of-fold stacker predictions on the frozen split.
 
@@ -137,8 +176,7 @@ def nested_stack(X, y, splits, C_reg=STACK_C):
     """
     oof = np.zeros(len(y))
     for itr, iva in splits:
-        m = LogisticRegression(C=C_reg, max_iter=2000)
-        m.fit(X[itr], y[itr])
+        m = _fit_stacker(X[itr], y[itr], C_reg)
         oof[iva] = m.predict_proba(X[iva])[:, 1]
     return oof
 
@@ -190,6 +228,23 @@ def build(exp_id: str = None, verbose: bool = True):
     best_single_auc = auc(y, best_single["oof"])
 
     chosen, stack_auc, history = greedy_select(kept, y, splits, floor)
+
+    # Greedy stops at the first addition worth less than a noise floor, which is right for a
+    # small pool and wrong for a large one: with 36 members every marginal gain is ~1e-5,
+    # but thirty of them accumulate. Measured, greedy took 6 members for 0.969041 while all
+    # 36 scored 0.969386 -- twelve floors discarded by the stopping rule. So try both and
+    # keep whichever the nested score prefers; the stacker's L2 penalty is what makes
+    # carrying weak members safe.
+    all_idx = list(range(len(kept)))
+    X_all = transform([kept[i]["oof"] for i in all_idx], len(all_idx))
+    auc_all = auc(y, nested_stack(X_all, y, splits))
+    if verbose:
+        print(f"\n  greedy {len(chosen)} members {stack_auc:.6f}   "
+              f"vs all {len(all_idx)} members {auc_all:.6f}")
+    if auc_all > stack_auc:
+        chosen, stack_auc = all_idx, auc_all
+        if verbose:
+            print("  -> keeping ALL members")
     if verbose:
         print(f"\nbest single member : {best_single['exp_id']} {best_single_auc:.6f}")
         print("greedy forward selection:")
@@ -202,7 +257,7 @@ def build(exp_id: str = None, verbose: bool = True):
     # The submitted prediction comes from a stacker fitted on ALL the OOF rows. That is
     # correct and is not the leak above: it never sees the test labels, and the score it is
     # judged on is the nested one computed a line earlier.
-    final = LogisticRegression(C=STACK_C, max_iter=2000).fit(Xtr, y)
+    final = _fit_stacker(Xtr, y, STACK_C)
     Xte = transform([kept[i]["pred"] for i in idx], len(idx))
     pred = final.predict_proba(Xte)[:, 1]
 
@@ -211,8 +266,9 @@ def build(exp_id: str = None, verbose: bool = True):
         print(f"\nstack of {len(idx)}: OOF {stack_auc:.6f}   vs best single "
               f"{best_single_auc:.6f}   delta {delta:+.6f} "
               f"({delta / floor:.1f}x floor {floor:.6f})")
+        coefs = final.named_steps["clf"].coef_[0]
         print("weights:", {kept[i]["exp_id"]: round(float(w), 3)
-                           for i, w in zip(idx, final.coef_[0])})
+                           for i, w in zip(idx, coefs)})
 
     if delta < C.MIN_DELTA_FLOORS * floor:
         if verbose:
@@ -227,7 +283,7 @@ def build(exp_id: str = None, verbose: bool = True):
         hypothesis=f"logit stack of {len(idx)} members: "
                    + ", ".join(kept[i]["exp_id"] for i in idx),
         spec={"members": [kept[i]["exp_id"] for i in idx],
-              "weights": [float(w) for w in final.coef_[0]],
+              "weights": [float(w) for w in final.named_steps["clf"].coef_[0]],
               "transform": "logit" if len(idx) <= RANKGAUSS_ABOVE else "rankgauss",
               "model_family": "stacker"},
     )
@@ -291,6 +347,16 @@ def member_frames(exclude_families=("blend", "stack", "confirm")):
             continue
         tr[e] = oof
         te[e] = pred
+
+    # Public members too. Without these a stacking run trains on our own pool only, which
+    # correlates at 0.98-0.998 -- there is nothing for a second-level model to find in a set
+    # of near-copies, and the diversity that took the blend from 4.3 to 15.8 noise floors
+    # would be invisible to it.
+    from harness import ingest
+    for name, oof, pred in ingest.members():
+        if len(oof) == len(y) and len(pred) == C.N_TEST:
+            tr[name] = oof
+            te[name] = pred
     train = pd.DataFrame(tr)
     train[C.ID] = np.arange(len(y))
     train[C.TARGET] = y

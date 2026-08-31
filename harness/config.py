@@ -1,4 +1,5 @@
 """Frozen constants. Nothing here changes once the first experiment has run."""
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,9 +15,23 @@ REPORTS = ROOT / "reports"
 for _d in (STATE, OOF_DIR, PRED_DIR, SUB_DIR, EXT_OOF, REPORTS):
     _d.mkdir(parents=True, exist_ok=True)
 
-COMPETITION = "playground-series-s6e8"
-TARGET = "addicted_label"
-ID = "id"
+# Everything below is READ OFF data/ by harness.profile rather than written here, so a
+# different classification dataset needs no edit. The values are asserted against what the
+# files actually contain at load time (harness/data.py), so a wrong inference fails loudly
+# rather than corrupting a run.
+#
+# COMPETITION is the exception: nothing in a CSV names the Kaggle competition, so it stays a
+# setting. Override any of these with an env var if the inference is wrong for your data.
+from harness import profile as _profile
+
+_P = _profile.profile()
+
+COMPETITION = os.environ.get("COMPETITION", "playground-series-s6e8")
+TARGET = os.environ.get("TARGET", _P["target"])
+ID = os.environ.get("ID", _P["id"])
+
+N_TRAIN = _P["n_train"]
+N_TEST = _P["n_test"]
 
 # --- FROZEN. The community convention; every public OOF library aligns to it. ---
 N_FOLDS = 5
@@ -27,14 +42,13 @@ N_TEST = 296302
 
 # Promotion rule (SPEC 5.3). The floor is measured by `python -m harness.confirm`, which
 # writes state/noise_floor.txt; this value is only the fallback until it has been run.
-# Columns the harness target-encodes out-of-fold and injects as `te_<col>` before
-# make_features is called. These are the two documented high-cardinality lookup keys --
-# the ones whose adjacent integer values shift the target rate by 0.22. See harness/encode.py.
-TE_COLUMNS = ("notifications_per_day", "app_opens_per_day")
+# Columns the harness target-encodes and frequency-encodes out-of-fold, injected as
+# te_<col> / freq_<col> before make_features is called. Derived: integer-valued columns with
+# enough distinct values to behave as lookup keys rather than quantities. See
+# harness/profile.py for the thresholds.
+TE_COLUMNS = tuple(_P["high_cardinality"])
 TE_SMOOTHING = 10.0
-
-# Columns the harness frequency-encodes (fitted on train, applied to both frames).
-FREQ_COLUMNS = ("notifications_per_day", "app_opens_per_day")
+FREQ_COLUMNS = tuple(_P["high_cardinality"])
 
 # Train/test consistency gate. train and test are iid draws here, so an honestly-built
 # feature scores ~0.0002. loop06's per-frame frequency encoding scored 0.10 and 0.016, and
